@@ -1,0 +1,23 @@
+# 运行时产物，别进仓库
+__pycache__/
+*.pyc
+*.pyo
+
+# 本地数据（记忆库、备份、缓存）
+*.db
+*.db-wal
+*.db-shm
+memory-backup-*.db
+caption_cache.db
+
+# 本机路径/密钥
+panel-python.txt
+history.json
+deepseek-key.txt
+.env
+
+# 编辑器/系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

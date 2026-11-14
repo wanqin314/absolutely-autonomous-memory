@@ -1,0 +1,256 @@
+{
+  "db_path": {
+    "description": "记忆库路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空 = plugin_data/astrbot_plugin_absolutely_autonomous_memory/memory.db"
+  },
+  "provider_id": {
+    "description": "提炼用哪个模型",
+    "type": "string",
+    "default": "deepseek/deepseek-flash",
+    "hint": "留空则用当前会话默认模型。"
+  },
+  "batch_size": {
+    "description": "攒多少行触发提炼",
+    "type": "int",
+    "default": 4,
+    "hint": "基础值；聊得热时自动翻倍、安静时减半。"
+  },
+  "idle_minutes": {
+    "description": "隔多久没说话就结一次",
+    "type": "int",
+    "default": 10
+  },
+  "impression_enabled": {
+    "description": "给不给「印象」",
+    "type": "bool",
+    "default": true,
+    "hint": "只递「熟悉度/条数/类别」，不含内容、不带动词。"
+  },
+  "vectors_enabled": {
+    "description": "启动后补齐向量",
+    "type": "bool",
+    "default": true,
+    "hint": "用本机 bge-m3（Ollama）把记忆向量化。"
+  },
+  "decay_enabled": {
+    "description": "开不开「淡忘」",
+    "type": "bool",
+    "default": true,
+    "hint": "每错过一个稳定度周期，稳定度 ×0.85；只影响多容易想起，不删任何东西。"
+  },
+  "decay_interval_hours": {
+    "description": "多久算一次淡忘",
+    "type": "int",
+    "default": 6,
+    "hint": "跑得再勤也不会重复扣（按上次衰减时间记账）。"
+  },
+  "resolve_max_per_run": {
+    "description": "每次提炼，最多用事实了结几件未了的事",
+    "type": "int",
+    "default": 5,
+    "hint": "调大能更快收尾，但每一次判定都可能误作废约定，建议不超过 5。"
+  },
+  "correction_hours": {
+    "description": "更正持续注入多少小时",
+    "type": "int",
+    "default": 24,
+    "hint": "作废/了结后，这小时内每轮都提醒她一次；0 表示只提醒一次。"
+  },
+  "idle_sweep_enabled": {
+    "description": "空闲扫描：超过 idle_minutes 没动静就自动收尾",
+    "type": "bool",
+    "default": true,
+    "hint": "关掉的话，只有收到新消息时才会检查空闲。"
+  },
+  "raw_retention_days": {
+    "description": "原始对话保留多少天",
+    "type": "int",
+    "default": 90,
+    "hint": "原话只追加、不进检索；填 0 表示永久保留。语音和图片只有占位，没有内容。"
+  },
+  "topics_review_enabled": {
+    "description": "每晚让她给自己翻过的旧记忆起主题",
+    "type": "bool",
+    "default": true,
+    "hint": "只处理她当天真的翻到过、且还没有主题的记忆，每天最多几条。"
+  },
+  "topics_review_hour": {
+    "description": "几点开始复盘",
+    "type": "int",
+    "default": 23,
+    "hint": "24 小时制；到点后如果还没跑过，会在十分钟内跑一次。"
+  },
+  "topics_review_count": {
+    "description": "每晚最多给几条起名",
+    "type": "int",
+    "default": 5,
+    "hint": "调大会让她每晚读更多旧记忆，成本也会增加。"
+  },
+  "topics_review_minute": {
+    "description": "复盘从几分开始",
+    "type": "int",
+    "default": 0,
+    "hint": "配合「几点」用，比如 22 点 20 分。"
+  },
+  "embedding_mode": {
+    "description": "向量服务类型",
+    "type": "string",
+    "default": "ollama",
+    "hint": "ollama（本机）或 openai（任意 OpenAI 兼容接口，如 /v1/embeddings）。"
+  },
+  "embedding_url": {
+    "description": "向量接口地址",
+    "type": "string",
+    "default": "http://127.0.0.1:11434/api/embed",
+    "hint": "Ollama 用 /api/embed；OpenAI 兼容用 https://…/v1/embeddings。"
+  },
+  "embedding_model": {
+    "description": "向量模型",
+    "type": "string",
+    "default": "bge-m3",
+    "hint": "Ollama 里 ollama pull bge-m3；OpenAI 兼容填对应模型名（如 text-embedding-3-small）。"
+  },
+  "embedding_api_key": {
+    "description": "向量接口的 Key（可选）",
+    "type": "string",
+    "default": "",
+    "hint": "OpenAI 兼容接口需要；Ollama 留空。"
+  },
+  "stale_days": {
+    "description": "多久没动就转「沉默」",
+    "type": "int",
+    "default": 7,
+    "hint": "挂着的约定/未了超过这么多天没动，就不再提醒，但还留在记忆里可检索。"
+  },
+  "proactive_reminder_enabled": {
+    "description": "到点的事排队太久时，让她主动发一条",
+    "type": "bool",
+    "default": true,
+    "hint": "默认开启：提醒排队超过设定时间、且对方一直没说话，就用她自己的语气主动发出来。"
+  },
+  "proactive_reminder_idle_minutes": {
+    "description": "安静多久才主动发",
+    "type": "int",
+    "default": 30,
+    "hint": "对方最后一次说话距现在超过这个分钟数，才主动开口。"
+  },
+  "proactive_reminder_quiet_hours": {
+    "description": "静默时段",
+    "type": "string",
+    "default": "1-7",
+    "hint": "这些小时不主动发（24 小时制，如 1-7 或 23-24,0-7）。"
+  },
+  "old_days": {
+    "description": "沉默多少天后转“旧事”（不再主动浮现）",
+    "type": "int",
+    "default": 30,
+    "hint": "默认 30 天。到 30 天只降权、不删，也不会自动了结。"
+  },
+  "wander_enabled": {
+    "description": "开启走神（默认关；先测）",
+    "type": "bool",
+    "default": false
+  },
+  "wander_interval_min": {
+    "description": "多久醒一次（分钟）",
+    "type": "int",
+    "default": 180
+  },
+  "wander_probability": {
+    "description": "醒来后真的往下想的概率",
+    "type": "float",
+    "default": 0.25
+  },
+  "wander_idle_minutes": {
+    "description": "你安静多久才允许她开口",
+    "type": "int",
+    "default": 30
+  },
+  "wander_max_per_day": {
+    "description": "每天最多主动说几次",
+    "type": "int",
+    "default": 3
+  },
+  "wander_quiet_hours": {
+    "description": "静默时段，比如 1-7",
+    "type": "string",
+    "default": "1-7"
+  },
+  "wander_session": {
+    "description": "在哪个会话走神；留空=最近私聊",
+    "type": "string",
+    "default": ""
+  },
+  "wander_provider_id": {
+    "description": "走神用哪个模型；留空=当前会话模型",
+    "type": "string",
+    "default": ""
+  },
+  "wander_dry_run": {
+    "description": "演练：走神只跑模型和落库，不发消息",
+    "type": "bool",
+    "default": false
+  },
+  "wander_prob_return": {
+    "description": "wander_prob_return 触发后真的往下想的概率",
+    "type": "float",
+    "default": 0.8
+  },
+  "wander_prob_memory": {
+    "description": "wander_prob_memory 触发后真的往下想的概率",
+    "type": "float",
+    "default": 0.5
+  },
+  "wander_prob_stale": {
+    "description": "wander_prob_stale 触发后真的往下想的概率",
+    "type": "float",
+    "default": 0.25
+  },
+  "wander_prob_idle": {
+    "description": "wander_prob_idle 触发后真的往下想的概率",
+    "type": "float",
+    "default": 0.4
+  },
+  "wander_max_thoughts_per_day": {
+    "description": "每天最多“想”几次（含沉默和演练，防止触发太多烧 token）",
+    "type": "int",
+    "default": 6
+  },
+  "review_after_days": {
+    "description": "几天没动静就问一句“还算数吗”",
+    "type": "int",
+    "default": 3
+  },
+  "dormant_after_days": {
+    "description": "问过之后多久没回应转休眠",
+    "type": "int",
+    "default": 7
+  },
+  "review_injection_enabled": {
+    "description": "是否注入“还算数吗”的提醒",
+    "type": "bool",
+    "default": true
+  },
+  "group_send_enabled": {
+    "description": "允许她在群聊里主动发话",
+    "type": "bool",
+    "default": false
+  },
+  "group_send_allow": {
+    "description": "允许主动发话的群号，逗号分隔；空=不允许，需显式填写群号",
+    "type": "string",
+    "default": ""
+  },
+  "group_send_max_per_day": {
+    "description": "每个群每天最多主动几条",
+    "type": "int",
+    "default": 2
+  },
+  "group_send_quiet_hours": {
+    "description": "群聊主动发话的静默时段",
+    "type": "string",
+    "default": "1-7"
+  }
+}
