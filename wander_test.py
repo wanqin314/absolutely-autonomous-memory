@@ -43,7 +43,7 @@ def seed(store):
     store.add_core("我是小鲸鱼，嘴硬，认人。")
     store.conn.execute(
         "INSERT INTO raw_message(session_id, scope, role, text, sender, created_at, source) "
-        "VALUES ('sess','private','user','嗨','某人',?, 'live')",
+        "VALUES ('sess','private','user','嗨','婉清',?, 'live')",
         ((datetime.now() - timedelta(minutes=60)).isoformat(timespec="seconds"),))
     store.conn.commit()
     return a
@@ -122,7 +122,7 @@ def main():
     st = Store(db)
     st.conn.execute(
         "INSERT INTO raw_message(session_id, scope, role, text, sender, created_at, source) "
-        "VALUES ('sess','private','user','刚说的','某人',?, 'live')",
+        "VALUES ('sess','private','user','刚说的','婉清',?, 'live')",
         (datetime.now().isoformat(timespec="seconds"),))
     st.conn.commit(); st.close()
     prov = FakeProvider('{"decision":"silent","source_trace":%d,"reason":"x","message":""}' % tid_b)

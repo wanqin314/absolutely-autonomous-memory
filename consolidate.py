@@ -60,8 +60,9 @@ JUDGE_TEMPLATE = """下面是她记下的几条事（同一个类型）：
 
 注意：
 - 时间、地点、数量不同的，是不同的事，不是重复；
+- **同一件事在不同天反复发生（例如每天叫他起床），是不同发生，不要合并**；只合并同一次发生/同一事实的不同说法；
 - 同一个人的名字/身份/生日这类事实，说法不同也算重复；
-- 反复发生的同一件事（例如"又发图我又看不到"），算重复，合并成一句概括。
+- 只有同一个场景（scope）里的才放在一起判断，不要跨私聊/群聊。
 """
 
 
@@ -71,7 +72,7 @@ def _norm(t: str) -> str:
 
 def load_traces(store) -> list[dict]:
     rows = store.conn.execute(
-        """SELECT t.id, t.kind, t.importance, t.tags, v.text FROM trace t
+        """SELECT t.id, t.kind, t.importance, t.tags, t.scope, v.text FROM trace t
            JOIN trace_version v ON v.id = t.head_version_id
            WHERE t.status='active' AND t.avoided=0 AND t.merged_into IS NULL
              AND t.kind IN ('fact','observation') AND t.importance < ?
@@ -83,7 +84,7 @@ def load_traces(store) -> list[dict]:
             continue
         out.append({"id": int(r["id"]), "kind": r["kind"], "importance": float(r["importance"]),
                     "tags": json.loads(r["tags"]) if r["tags"] else [], "text": r["text"] or "",
-                    "vec": retriever.unpack(vr["vec"])})
+                    "scope": r["scope"] or "", "vec": retriever.unpack(vr["vec"])})
     return out
 
 
@@ -104,6 +105,8 @@ def build_clusters(traces: list[dict]) -> list[list[int]]:
     for a in range(len(traces)):
         for b in range(a + 1, len(traces)):
             if traces[a]["kind"] != traces[b]["kind"]:
+                continue
+            if traces[a]["scope"] != traces[b]["scope"]:
                 continue
             if float(sim[a, b]) < CLUSTER_COS:
                 continue
@@ -165,6 +168,9 @@ def apply_merge(store, ids: list[int], merged_text: str) -> int:
     new_id = store.add_trace(
         merged_text.strip(), kind, importance=importance,
         tags=tags + ["合并"], source="merge", reason="consolidation",
+        scope=rows[0]["scope"] or "",
+        episode_id=rows[0]["episode_id"],
+        anchor_time=min((r["created_at"] or "") for r in rows),
     )
     for r in rows:
         store.archive(int(r["id"]), merged_into=new_id)

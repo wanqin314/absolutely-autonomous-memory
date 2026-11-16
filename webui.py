@@ -68,6 +68,49 @@ def db() -> Store:
     return Store(DB)
 
 
+def _scope_label(scope: str) -> str:
+    sc = (scope or "").strip()
+    if sc == "global":
+        return "全局"
+    if sc.startswith("group:"):
+        return "群聊 " + sc.split(":", 1)[1]
+    if sc.startswith("private:"):
+        return "私聊 · " + sc.split(":", 1)[1]
+    if sc == "private":
+        return "私聊"
+    return sc or "—"
+
+
+@app.get("/api/series")
+def api_series():
+    s = db()
+    try:
+        rows = s.series_list()
+        for r in rows:
+            r["scope_label"] = _scope_label(r.get("scope"))
+        return rows
+    finally:
+        s.close()
+
+
+@app.get("/api/series/{sid}")
+def api_series_one(sid: int):
+    s = db()
+    try:
+        data = s.series_show(int(sid))
+        if not data:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        data["scope_label"] = _scope_label(data.get("scope"))
+        # 面板按对话时间排；event_time 只最后兜底
+        data["members"] = sorted(
+            data.get("members") or [],
+            key=lambda m: str(m.get("anchor_time") or m.get("created_at")
+                              or m.get("event_time") or ""))
+        return data
+    finally:
+        s.close()
+
+
 @app.get("/api/stats")
 def api_stats():
     s = db()
@@ -157,6 +200,18 @@ def api_trace(tid: int):
         t["state"] = row["state"] if "state" in row.keys() else "open"
         t["kind"] = row["kind"]
         t["due_at"] = row["due_at"] if "due_at" in row.keys() else None
+        try:
+            t["series"] = [
+                {"id": int(r["id"]), "name": r["name"] or "",
+                 "scope": r["scope"] or ""}
+                for r in s.conn.execute(
+                    """SELECT s.id, s.name, s.scope FROM series_member m
+                       JOIN memory_series s ON s.id=m.series_id
+                       WHERE m.trace_id=? AND m.status='active' AND s.status='active'
+                       ORDER BY s.id""", (tid,))
+            ]
+        except Exception:
+            t["series"] = []
         _sc = row["scope"] if "scope" in row.keys() else ""
         if (_sc or "").startswith("group:"):
             t["scope_label"] = "群聊 " + _sc.split(":", 1)[1]
@@ -319,6 +374,7 @@ textarea{width:100%;min-height:60px;background:var(--panel);border:1px solid var
       <button id="tab-recent" class="on" onclick="loadRecent()">最近</button>
       <button id="tab-unres" onclick="loadUnresolved()">未了的事</button>
       <button id="tab-tags" onclick="loadTags()">按主题</button>
+      <button id="tab-series" onclick="loadSeries()">系列</button>
       <button id="tab-ov" onclick="loadOverview()">总览</button>
       <button id="tab-st" onclick="loadStats()">统计</button>
       <button id="tab-raw" onclick="loadRaw()">原话</button>
@@ -382,6 +438,43 @@ async function loadRaw(){
   const html=(d.tags||[]).map(t=>`<div class="item" onclick="doSearch('${esc(t.tag)}')">
     <div class="txt">${esc(t.tag)}</div><div class="small">${t.count} 条</div></div>`).join('');
   document.getElementById('list').innerHTML = html||'<div class="empty">没有标签</div>';}
+
+function scopeLabelJS(sc){
+  sc=sc||'';
+  if(sc==='global')return '全局';
+  if(sc.indexOf('group:')===0)return '群聊 '+sc.slice(6);
+  if(sc.indexOf('private:')===0)return '私聊 · '+sc.slice(8);
+  if(sc==='private')return '私聊';
+  return sc||'—';
+}
+const fmtWhen=s=>String(s||'').slice(0,16).replace('T',' ')||'—';
+async function loadSeries(){
+  setTab('tab-series');
+  const d=await j('/api/series');
+  document.getElementById('list').innerHTML = d.length ? d.map(s=>`
+    <div class="item" onclick="openSeries(${s.id},this)">
+      <div><span class="kind">系列</span><span class="small">#${s.id} · ${scopeLabelJS(s.scope)} · ${s.n||0} 条</span></div>
+      <div class="txt">${esc(s.name)}</div>
+    </div>`).join('') : '<div class="empty">还没有系列</div>';
+  document.getElementById('detail').innerHTML='<div class="empty">点一个系列看里面的发生</div>';
+}
+async function openSeries(sid,el){
+  document.querySelectorAll('.item').forEach(x=>x.classList.remove('active'));
+  el?.classList.add('active');
+  const s=await j('/api/series/'+sid);
+  const rows=(s.members||[]).map(m=>`
+    <div class="item" data-id="${m.id}" onclick="openTrace(${m.id},this)">
+      <div><span class="kind k-${m.kind}">${KIND[m.kind]||m.kind}</span>
+        <span class="small">${fmtWhen(m.anchor_time||m.created_at||m.event_time)} · #${m.id}</span></div>
+      <div class="txt">${esc((m.text||'').slice(0,100))}</div>
+    </div>`).join('');
+  document.getElementById('detail').innerHTML=`<div class="detail">
+    <h2>系列 #${s.id}「${esc(s.name)}」</h2>
+    <div class="row"><span>${scopeLabelJS(s.scope)}</span><span>${(s.members||[]).length} 条发生</span>
+      <span class="small">按对话时间排</span></div>
+    <div class="box"><h3>里面的记忆</h3>${rows||'<div class="small">空</div>'}</div>
+  </div>`;
+}
 function setTab(id){document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));
   document.getElementById(id)?.classList.add('on');}
 async function doSearch(q){
@@ -487,6 +580,7 @@ async function openTrace(id,el){
       <span>此刻 R=${t.r_now}</span><span>想起 ${t.activations} 次</span>
       <span>版本 ${t.version_no}</span><span>场合 ${t.scope_label||'—'}</span>
       <span style="color:${stateColor}">状态 ${stateTxt}</span>${t.avoided?'<span style="color:var(--warn)">回避中</span>':''}</div>
+    ${(t.series&&t.series.length)?`<div class="small" style="margin:-4px 0 10px">系列：${t.series.map(s=>`<a href="#" onclick="openSeries(${s.id});return false" style="color:var(--acc)">「${esc(s.name)}」</a>`).join(' · ')}</div>`:''}
     <div class="box"><h3>当前这一版</h3><div class="txt">${esc(t.text)}</div>
       <div style="margin-top:8px">${(t.tags||[]).map(x=>`<span class="tag">${esc(x)}</span>`).join('')}</div>
       ${(t.topics&&t.topics.length)?`<div class="small" style="margin-top:6px">主题：${t.topics.map(esc).join(' · ')}</div>`:''}
@@ -533,7 +627,7 @@ if (new URLSearchParams(location.search).get('embed') === '1') {
   document.querySelector('main').style.height = 'calc(100vh - 8px)';
 }
 // 支持 ?id=123 直接打开某一条
-const _q = new URLSearchParams(location.search); if (_q.get('tab') === 'ov') { setTimeout(() => loadOverview(), 200); } if (_q.get('tab') === 'st') { setTimeout(() => loadStats(), 200); } const deepId = _q.get('id');
+const _q = new URLSearchParams(location.search); if (_q.get('tab') === 'ov') { setTimeout(() => loadOverview(), 200); } if (_q.get('tab') === 'st') { setTimeout(() => loadStats(), 200); } if (_q.get('tab') === 'series') { setTimeout(() => loadSeries(), 200); } const deepId = _q.get('id');
 if (deepId) setTimeout(() => openTrace(parseInt(deepId)), 300);
 </script></body></html>"""
 

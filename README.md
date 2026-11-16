@@ -34,7 +34,7 @@ AstrBot 插件，作者：婉清。MIT License。
 | 版本链 | 同一件事的新说法追加版本，旧版不删 |
 | 三块字段 | `text` 只写事实与动作；`felt` 当时的感觉；`reaction` 当时的反应；另有 `inference` + 置信度 |
 | 原话 | 提炼时留一句 `anchor_quote`，完整对话在 `episode.transcript` |
-| 去重 | 近似重复合并，不重复堆 |
+| 去重 | 同类型近似重复按时间窗归并；不同天的发生不合并，检索按同系列折叠 |
 
 ### 她自己的东西
 
@@ -43,6 +43,15 @@ AstrBot 插件，作者：婉清。MIT License。
 | `leave_my_words` | 在一条记忆后面留一句自己的话 |
 | `keep_quote` | 自己钉一句真正的原话，覆盖提炼时那句的显示 |
 | `read_memory(original=True)` | 按需查看当时那段对话原文 |
+
+
+### 常驻区（她自己放的）
+
+`resident_add` / `resident_retire` / `resident_list`：她自己决定放什么、撤什么；每轮原样注入，不筛选、不总结；最多 12 条 / 1200 字，满了拒绝，不自动清。
+
+### 系列（她自己分的）
+
+`series_create` / `series_rename` / `series_add` / `series_remove` / `series_retire` / `series_list` / `series_show`：把一类反复发生的事挂成系列；只加链接，不改正文、不删记忆；一条记忆可以同时属于多个系列；`series_show` 支持 `since` / `until` / `limit` / `query`，按对话时间排。
 
 ### 检索
 
@@ -98,9 +107,9 @@ AstrBot 插件，作者：婉清。MIT License。
 工具 `send_group_message(text, group="")`：
 
 - 她决定说，才说；不是系统定时在群里找话
-- 群白名单、每群每日上限、静默时段
+- 群白名单（空 = 全部群）、每群每日上限（0 = 不限）、静默时段
 - 不填群号就用当前群；在私聊里用需带群号
-- 默认白名单为空 = 不允许，必须显式配置
+- 默认关闭，必须显式开启；白名单留空表示不限制群
 
 ### 核心层
 
@@ -112,7 +121,8 @@ AstrBot 插件，作者：婉清。MIT License。
 
 | 工具 | 作用 |
 |---|---|
-| `recall_memory` | 翻记忆；支持 query / kind / limit / since / until / scope / person |
+| `recall_memory` | 翻记忆；支持 query / kind / limit / since / until / scope / person / sort |
+| `sort_last_recall` | 把刚才那批按时间/相关度重排，不重新搜 |
 | `read_memory` | 深读一条；`original=True` 看当时对话 |
 | `recall_day` | 按天回想 |
 | `memory_directory` | 记忆目录 |
@@ -126,6 +136,8 @@ AstrBot 插件，作者：婉清。MIT License。
 | `read_core_memory` | 读核心层 |
 | `write_core_memory` | 写核心层 |
 | `send_group_message` | 在允许的群里主动说一句 |
+| `resident_add` / `resident_retire` / `resident_list` | 她自己放的常驻区 |
+| `series_*` | 她自己分的系列：建 / 改名 / 加 / 移出 / 撤 / 列 / 看 |
 
 命令：`/mem ...`（管理员）
 
@@ -174,7 +186,8 @@ Plugin astrbot_plugin_absolutely_autonomous_memory (vX) by 婉清
 | `proactive_reminder_enabled` | true | 到点提醒 |
 | `wander_enabled` | false | 走神，默认关 |
 | `group_send_enabled` | false | 群聊主动发话，默认关 |
-| `group_send_allow` | 空 | 群白名单，空 = 不允许 |
+| `group_send_allow` | 空 | 空 = 全部群；要先开 group_send_enabled |
+| `group_send_max_per_day` | 0 | 0 = 不限 |
 
 完整项见 `_conf_schema.json`。
 
@@ -196,7 +209,7 @@ python webui.py --port 21600
 ```
 
 - 只监听 `127.0.0.1`
-- 标签：最近 / 未了的事 / 按主题 / 总览 / 统计 / 原话
+- 标签：最近 / 未了的事 / 按主题 / 系列 / 总览 / 统计 / 原话
 - 详情显示版本链、她自己的话、她留的原话、提炼原话、感觉/反应/推断
 - 可改重要度、加旁注、标作废或了结、改写（追加版本）
 

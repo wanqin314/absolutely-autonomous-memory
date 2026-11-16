@@ -21,6 +21,30 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 KINDS = ("fact", "observation", "speculation", "self", "unresolved", "promise", "agreement")
+RESIDENT_MAX_ITEMS = 12
+RESIDENT_MAX_CHARS = 1200
+RESIDENT_MAX_ONE = 500
+
+
+def _series_scope_compatible(trace_scope: str, series_scope: str) -> bool:
+    """系列场景和记忆场景是否相容。
+
+    旧记忆的私聊 scope 只写 `private`，系列可能是 `private:<qq>`；
+    这两个是同一个私聊，不能判成“场景对不上”。群聊仍要求同一个群号。
+    """
+    ts = (trace_scope or "").strip()
+    ss = (series_scope or "").strip()
+    if ss == "global":
+        return True
+    if ts == ss:
+        return True
+    if ts == "private" and ss.startswith("private:"):
+        return True
+    if ss == "private" and ts.startswith("private:"):
+        return True
+    if ss == "group" and ts.startswith("group:"):
+        return True
+    return False
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -150,6 +174,42 @@ CREATE TABLE IF NOT EXISTS core_memory (
     created_at TEXT NOT NULL,
     text       TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS resident_note (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    scope      TEXT NOT NULL DEFAULT 'global',
+    status     TEXT NOT NULL DEFAULT 'active',
+    retired_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_resident_scope
+    ON resident_note(status, scope, id);
+
+CREATE TABLE IF NOT EXISTS memory_series (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    scope      TEXT NOT NULL DEFAULT 'private',
+    note       TEXT DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'active',
+    retired_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_series_scope
+    ON memory_series(status, scope, id);
+
+CREATE TABLE IF NOT EXISTS series_member (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    series_id INTEGER NOT NULL,
+    trace_id  INTEGER NOT NULL,
+    added_at  TEXT NOT NULL,
+    status    TEXT NOT NULL DEFAULT 'active',
+    UNIQUE(series_id, trace_id)
+);
+CREATE INDEX IF NOT EXISTS idx_series_member
+    ON series_member(series_id, status);
+CREATE INDEX IF NOT EXISTS idx_series_trace
+    ON series_member(trace_id, status);
 
 CREATE TABLE IF NOT EXISTS wander_trigger (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -944,6 +1004,170 @@ class Store:
         rows = self.conn.execute(
             "SELECT * FROM core_memory ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------- 她自己放的常驻区 ----------
+
+    def resident_add(self, text: str, scope: str = "global") -> int:
+        """她自己往常驻区放一条。满了不自动清，直接报错让她先撤。"""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("内容是空的")
+        if len(text) > RESIDENT_MAX_ONE:
+            raise ValueError(f"一条最多 {RESIDENT_MAX_ONE} 字，这条 {len(text)} 字")
+        scope = (scope or "global").strip() or "global"
+        rows = self.conn.execute(
+            "SELECT text FROM resident_note WHERE status='active'").fetchall()
+        if len(rows) >= RESIDENT_MAX_ITEMS:
+            raise ValueError(
+                f"常驻区满了（{RESIDENT_MAX_ITEMS} 条），先 resident_retire 一条再放")
+        total = sum(len(r["text"] or "") for r in rows)
+        if total + len(text) > RESIDENT_MAX_CHARS:
+            raise ValueError(
+                f"常驻区字数满了（{RESIDENT_MAX_CHARS} 字），先撤一条再放")
+        cur = self.conn.execute(
+            "INSERT INTO resident_note(created_at, text, scope, status) VALUES (?,?,?, 'active')",
+            (now_iso(), text, scope))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def resident_active(self, scopes: list[str] | None = None) -> list[dict]:
+        if scopes:
+            marks = ",".join("?" for _ in scopes)
+            rows = self.conn.execute(
+                f"SELECT * FROM resident_note WHERE status='active' AND scope IN ({marks}) "
+                "ORDER BY id", tuple(scopes)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM resident_note WHERE status='active' ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+
+    def resident_retire(self, note_id: int) -> bool:
+        cur = self.conn.execute(
+            "UPDATE resident_note SET status='retired', retired_at=? "
+            "WHERE id=? AND status='active'", (now_iso(), int(note_id)))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    # ---------- 她自己分的系列 ----------
+
+    def series_create(self, name: str, scope: str, note: str = "") -> int:
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("系列名是空的")
+        if len(name) > 60:
+            raise ValueError("系列名最多 60 字")
+        scope = (scope or "private").strip() or "private"
+        cur = self.conn.execute(
+            "INSERT INTO memory_series(created_at, name, scope, note, status) "
+            "VALUES (?,?,?,?, 'active')",
+            (now_iso(), name, scope, (note or "").strip()[:200]))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def series_set_scope(self, series_id: int, scope: str) -> bool:
+        cur = self.conn.execute(
+            "UPDATE memory_series SET scope=? WHERE id=? AND status='active'",
+            ((scope or "").strip() or "private", int(series_id)))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def series_add(self, series_id: int, trace_id: int) -> bool:
+        s = self.conn.execute(
+            "SELECT * FROM memory_series WHERE id=? AND status='active'",
+            (int(series_id),)).fetchone()
+        if not s:
+            raise ValueError(f"系列 #{int(series_id)} 不存在或已撤")
+        t = self.trace_row(int(trace_id))
+        if not t:
+            raise ValueError(f"记忆 #{int(trace_id)} 不存在")
+        if t["status"] != "active":
+            raise ValueError(f"记忆 #{int(trace_id)} 不是 active")
+        if not _series_scope_compatible(t["scope"] or "", s["scope"] or ""):
+            raise ValueError(
+                f"记忆 #{int(trace_id)} 在 {t['scope'] or '未知场景'}，"
+                f"系列是 {s['scope']}，不能跨场景放")
+        ex = self.conn.execute(
+            "SELECT id FROM series_member WHERE series_id=? AND trace_id=? AND status='active'",
+            (int(series_id), int(trace_id))).fetchone()
+        if ex:
+            return False
+        self.conn.execute(
+            "INSERT INTO series_member(series_id, trace_id, added_at, status) "
+            "VALUES (?,?,?, 'active') "
+            "ON CONFLICT(series_id, trace_id) DO UPDATE SET status='active', added_at=excluded.added_at",
+            (int(series_id), int(trace_id), now_iso()))
+        self.conn.commit()
+        return True
+
+    def series_remove(self, series_id: int, trace_id: int) -> bool:
+        cur = self.conn.execute(
+            "UPDATE series_member SET status='removed' "
+            "WHERE series_id=? AND trace_id=? AND status='active'",
+            (int(series_id), int(trace_id)))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def series_retire(self, series_id: int) -> bool:
+        cur = self.conn.execute(
+            "UPDATE memory_series SET status='retired', retired_at=? "
+            "WHERE id=? AND status='active'", (now_iso(), int(series_id)))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def series_list(self, scopes: list[str] | None = None) -> list[dict]:
+        if scopes:
+            marks = ",".join("?" for _ in scopes)
+            rows = self.conn.execute(
+                f"""SELECT s.*, COUNT(m.id) AS n, MAX(m.added_at) AS last_added
+                    FROM memory_series s
+                    LEFT JOIN series_member m ON m.series_id=s.id AND m.status='active'
+                    WHERE s.status='active' AND s.scope IN ({marks})
+                    GROUP BY s.id ORDER BY s.id DESC""", tuple(scopes)).fetchall()
+        else:
+            rows = self.conn.execute(
+                """SELECT s.*, COUNT(m.id) AS n, MAX(m.added_at) AS last_added
+                   FROM memory_series s
+                   LEFT JOIN series_member m ON m.series_id=s.id AND m.status='active'
+                   WHERE s.status='active'
+                   GROUP BY s.id ORDER BY s.id DESC""").fetchall()
+        return [dict(r) for r in rows]
+
+    def series_show(self, series_id: int) -> dict | None:
+        s = self.conn.execute(
+            "SELECT * FROM memory_series WHERE id=?", (int(series_id),)).fetchone()
+        if not s:
+            return None
+        rows = self.conn.execute(
+            """SELECT t.id, t.kind, t.created_at, t.scope,
+                      v.text, v.anchor_time, v.event_time
+               FROM series_member m
+               JOIN trace t ON t.id=m.trace_id
+               JOIN trace_version v ON v.id=t.head_version_id
+               WHERE m.series_id=? AND m.status='active'
+               ORDER BY COALESCE(v.anchor_time, t.created_at, v.event_time)""",
+            (int(series_id),)).fetchall()
+        out = dict(s)
+        out["members"] = [dict(r) for r in rows]
+        return out
+
+    def series_for_traces(self, trace_ids: list[int]) -> dict[int, dict]:
+        ids = sorted({int(x) for x in trace_ids if x})
+        if not ids:
+            return {}
+        marks = ",".join("?" for _ in ids)
+        rows = self.conn.execute(
+            f"""SELECT m.trace_id, s.id, s.name, s.scope
+                FROM series_member m
+                JOIN memory_series s ON s.id=m.series_id
+                WHERE m.trace_id IN ({marks}) AND m.status='active' AND s.status='active'
+                ORDER BY s.id""", ids).fetchall()
+        out: dict[int, dict] = {}
+        for r in rows:
+            tid = int(r["trace_id"])
+            if tid not in out:  # 检索折叠时先按最早建的系列归组
+                out[tid] = {"id": int(r["id"]), "name": r["name"] or "",
+                            "scope": r["scope"] or ""}
+        return out
 
     def last_user_message_at(self, session_id: str) -> str:
         r = self.conn.execute(

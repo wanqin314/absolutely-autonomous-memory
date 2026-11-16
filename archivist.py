@@ -82,7 +82,7 @@ kind 只能是这六种：
   · 最多 1 个可以用你自己的说法（如「那句噎住的话」）；
   · 只能从原文里概括，不许联想、不许加原文没有的概念；
   · 禁用这些词：情绪、聊天、日常、事情、主人、我、他、她、它。
-- entities：这条记忆里**明确出现**的人、物、群、作品的名字，最多 3 个，只写名字（如「某人」「记忆插件」），不写代词、不写形容词；没有就给空数组。
+- entities：这条记忆里**明确出现**的人、物、群、作品的名字，最多 3 个，只写名字（如「婉清」「记忆插件」），不写代词、不写形容词；没有就给空数组。
 - event_time：这件事**本身**什么时候发生/成立，ISO 格式带时区，比如 2026-11-11T15:00:00+08:00。
   原文说了「今天下午三点」「明天」「上周」就换算成绝对时间；没说、说不准就填 null，不要猜。
   只有「一点」「两点」这种没说上午还是下午的，看不出来就只写日期（不带时刻），别硬选。
@@ -167,17 +167,22 @@ def _safe_certainty(value):
         return None
 
 
+class ParseError(ValueError):
+    """提炼回复为空或不是可解析的 JSON；这类失败应退回缓冲、下次重试。"""
+
+
 def parse_items(text: str) -> tuple[list[dict], list[dict]]:
+    """# aam-parse-guard v1"""
     raw = (text or "").strip()
     if not raw:
-        return []
+        raise ParseError("空回复")
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
-        return []
+        raise ParseError("回复里没有 JSON")
     try:
         data = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as e:
+        raise ParseError(f"JSON 解不开：{e}") from e
     items = data.get("items")
     updates = data.get("updates")
     if not isinstance(items, list):
@@ -246,8 +251,10 @@ def parse_items(text: str) -> tuple[list[dict], list[dict]]:
 
 
 async def extract(provider, lines: list[dict], store=None) -> tuple[list[dict], list[dict]]:
-    if provider is None or not lines:
-        return []
+    if not lines:
+        return [], []
+    if provider is None:
+        raise ParseError("没有可用的对话模型")
     try:
         resp = await provider.text_chat(
             prompt=build_prompt(lines, store),
@@ -256,8 +263,7 @@ async def extract(provider, lines: list[dict], store=None) -> tuple[list[dict], 
             persist=False,
         )
     except Exception as e:  # noqa: BLE001
-        logger.warning(f"[memory] 提炼失败：{type(e).__name__}: {e}")
-        return []
+        raise ParseError(f"模型调用失败：{type(e).__name__}: {e}") from e
     items, updates = parse_items(getattr(resp, "completion_text", "") or "")
     if items:
         logger.info(f"[memory] 提炼出 {len(items)} 条：" +
@@ -283,10 +289,72 @@ def _norm(t: str) -> str:
     return "".join(ch for ch in (t or "") if ch.isalnum())
 
 
-def find_near_duplicate(store, text: str, kind: str) -> int | None:
+NEAR_DUP_MAX_HOURS = float(os.environ.get("AAM_NEAR_DUP_MAX_HOURS", "12") or 12)
+TIME_GATED_KINDS = ("observation",)
+
+
+def _hours_gap(a: str, b: str) -> float | None:
+    """两个 ISO 时间差多少小时；解析不了返回 None。"""
+    try:
+        from datetime import datetime
+        da = datetime.fromisoformat((a or "").replace("Z", "+00:00"))
+        db = datetime.fromisoformat((b or "").replace("Z", "+00:00"))
+        return abs((da - db).total_seconds()) / 3600.0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _too_far(when: str, existing: str) -> bool:
+    gap = _hours_gap(when, existing)
+    return gap is not None and gap > NEAR_DUP_MAX_HOURS
+
+
+def _near_dup_too_far(store, tid: int, when: str) -> bool:
+    """同一句话隔了太久，就是另一次发生，不是同一次事件的重复说法。"""
+    if not when or not tid:
+        return False
+    try:
+        row = store.conn.execute(
+            """SELECT NULLIF(v.event_time,'') AS et, v.anchor_time AS at, t.created_at AS ct
+               FROM trace t JOIN trace_version v ON v.id=t.head_version_id
+               WHERE t.id=?""", (int(tid),)).fetchone()
+    except Exception:  # noqa: BLE001
+        return False
+    if not row:
+        return False
+    existing = row["et"] or row["at"] or row["ct"] or ""
+    return _too_far(when, existing)
+
+
+def _find_duplicate_near(store, text: str, when: str, kind: str) -> int | None:
+    """完全相同的句子，只在时间窗内算重复；不同天要各自成为一次发生。
+
+    fact/self 这类稳定事实不受时间窗限制：隔几天说同一件事还是同一件事。
+    """
+    text = (text or "").strip()
+    if len(text) < 6:
+        return None
+    gate = when if kind in TIME_GATED_KINDS else ""
+    try:
+        rows = store.conn.execute(
+            """SELECT t.id,
+                      COALESCE(NULLIF(v.event_time,''), v.anchor_time, t.created_at) AS ts
+               FROM trace t JOIN trace_version v ON v.id=t.head_version_id
+               WHERE v.text=? ORDER BY t.id DESC""", (text,)).fetchall()
+    except Exception:  # noqa: BLE001
+        return None
+    for r in rows:
+        if not _too_far(gate, str(r["ts"] or "")):
+            return int(r["id"])
+    return None
+
+
+def find_near_duplicate(store, text: str, kind: str, when: str = "") -> int | None:
     """同类型里找重复的旧痕迹：**跟它的所有版本比**（不只是当前版本）。
 
     判定：向量相似 ≥0.90 且 字面相似 ≥0.60，两个条件同时满足才算重复。
+    另外要求两次相隔不超过 NEAR_DUP_MAX_HOURS（默认 12 小时）——
+    「每天叫他起床」这种同一句话在不同天的发生，不能并成一条。
     """
     import difflib
 
@@ -294,19 +362,26 @@ def find_near_duplicate(store, text: str, kind: str) -> int | None:
     if len(norm) < 4:
         return None
     vec = retriever.embed_sync(text) if len(norm) >= 10 else None
+    gate = when if kind in TIME_GATED_KINDS else ""
 
-    # 每条痕迹的全部版本，一次读出来
+    # 每条痕迹的全部版本，一次读出来；时间太远的候选直接排除
     versions: dict[int, list[str]] = {}
+    times: dict[int, str] = {}
     for r in store.conn.execute(
-            """SELECT v.trace_id AS tid, v.text FROM trace t
+            """SELECT v.trace_id AS tid, v.text,
+                      COALESCE(NULLIF(v.event_time,''), v.anchor_time, t.created_at) AS ts
+               FROM trace t
                JOIN trace_version v ON v.trace_id = t.id
                WHERE t.kind=? AND t.status='active' AND t.merged_into IS NULL""", (kind,)):
-        versions.setdefault(int(r["tid"]), []).append(r["text"] or "")
+        tid = int(r["tid"])
+        versions.setdefault(tid, []).append(r["text"] or "")
+        times[tid] = str(r["ts"] or "")
 
     best_id, best_ratio, best_cos = None, 0.0, 0.0
-    cand_ids = list(versions)
-    for tid in cand_ids:
-        for vt in versions[tid]:
+    for tid, texts in versions.items():
+        if _too_far(gate, times.get(tid, "")):
+            continue
+        for vt in texts:
             ratio = difflib.SequenceMatcher(None, norm, _norm(vt)).ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
@@ -317,8 +392,14 @@ def find_near_duplicate(store, text: str, kind: str) -> int | None:
         return best_id if best_ratio >= 0.92 else None
 
     for r in store.conn.execute(
-            """SELECT v.trace_id, v.vec FROM trace_vec v JOIN trace t ON t.id=v.trace_id
+            """SELECT tv.trace_id, tv.vec,
+                      COALESCE(NULLIF(v.event_time,''), v.anchor_time, t.created_at) AS ts
+               FROM trace_vec tv
+               JOIN trace t ON t.id=tv.trace_id
+               JOIN trace_version v ON v.id=t.head_version_id
                WHERE t.kind=? AND t.status='active' AND t.merged_into IS NULL""", (kind,)):
+        if _too_far(gate, str(r["ts"] or "")):
+            continue
         sim = retriever.cosine(vec, retriever.unpack(r["vec"]))
         if sim > best_cos:
             best_cos, best_id = sim, int(r["trace_id"])
@@ -495,6 +576,35 @@ def _pick_fact(store, promise_text: str, candidates: list[str], exclude_id: int 
     return best
 
 
+def apply_updates(store, updates: list[dict], candidates: list[str],
+                  session: str = "") -> list[dict]:
+    """只应用 settled/void；open 和其它状态一律不动。
+
+    updates 来自提炼模型，允许它写 open（表示“还是开着”）。以前 open 也会走
+    settle_with_fact，于是多写一条「后来才知道的事」；这里统一挡掉。
+    """
+    applied = []
+    for u in updates or []:
+        try:
+            st = str(u.get("state") or "").strip()
+            if st not in ("settled", "void"):
+                continue
+            oid = int(u.get("id"))
+            row = store.trace_row(oid)
+            if row is None:
+                continue
+            cur = str(row["state"] or "open")
+            if cur not in ("open", "missed"):
+                continue
+            applied.append(
+                settle_with_fact(store, oid, st, str(u.get("note") or ""),
+                                 candidates, session)
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[memory] 应用 updates 失败：{type(e).__name__}: {e}")
+    return applied
+
+
 def settle_with_fact(store, oid: int, state: str, why: str, candidates: list[str],
                      session: str = "") -> dict:
     """收掉一条约定/未了：改状态 + 尽量转成事实的一版 + 归档 + 记更正。
@@ -507,16 +617,16 @@ def settle_with_fact(store, oid: int, state: str, why: str, candidates: list[str
     head = store.conn.execute("SELECT text FROM trace_version WHERE id=?",
                               (row["head_version_id"],)).fetchone()
     promise_text = (head["text"] if head else "") or ""
-    store.settle(oid, state, f"被事实了结：{why}" if why else "被事实了结")
+    store.settle(oid, state, f"事实对账：{why}" if why else "事实对账：有新说法")
 
     src = _pick_fact(store, promise_text, candidates, exclude_id=oid)
     if src:
         fid, ftext = src
-        tail = "作废" if state == "void" else "了结"
-        delta = f"「{promise_text[:20]}」{tail}" + (f"（{why}）" if why else "")
+        delta = f"关联：以前记着「{promise_text[:20]}」" + (
+            f"；后来知道：{why}" if why else "；后来有新的说法")
         try:
             store.add_resolution(fid, delta)
-            store.add_note(fid, f"因此了结了 #{oid}：{promise_text[:30]}", kind="evidence")
+            store.add_note(fid, f"因此关联到 #{oid}：{promise_text[:30]}", kind="evidence")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[memory] 转事实失败：{type(e).__name__}")
         store.archive(oid, merged_into=fid)
@@ -524,10 +634,12 @@ def settle_with_fact(store, oid: int, state: str, why: str, candidates: list[str
         logger.info(f"[memory] #{oid} 只改了状态（没找到来源事实）")
 
     if session:
+        reason = why or "有新的说法"
         store.add_correction(
             session,
-            f"#{oid}「{promise_text[:30]}」已经{'作废' if state == 'void' else '了结'}"
-            + (f"：{why}" if why else "") + "。别再按原来的说法讲。",
+            f"以前记着：#{oid}「{promise_text[:30]}」。"
+            f"后来知道：{reason}。"
+            "算不算了结，你自己看。",
         )
     return {"id": oid, "state": state, "why": why, "as_fact": src[0] if src else None}
 
@@ -671,9 +783,11 @@ def write_items(store, items: list[dict], lines: list[dict], scope: str, session
     for it in items:
         if is_self_noise(it):
             continue
-        if store.find_duplicate(it["text"]):
+        when = it.get("event_time") or last_ts
+        dup_id = _find_duplicate_near(store, it["text"], when, it["kind"])
+        if dup_id:
             continue
-        near = find_near_duplicate(store, it["text"], it["kind"])
+        near = find_near_duplicate(store, it["text"], it["kind"], when)
         if near:
             # 同一件事换了个说法：不新建，给旧的追加一版
             store.add_version(

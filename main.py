@@ -19,7 +19,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
-from . import archivist, noticer, retriever
+from . import archivist, noticer, resident, retriever
 from .store import Store, days_between, now_iso
 
 HELP = (
@@ -34,12 +34,104 @@ HELP = (
     "/mem stats 统计"
 )
 
+_WEEKDAYS = "一二三四五六日"
+
+
+def _fmt_when(value: str) -> str:
+    """把 ISO 时间写成「2026-11-11 周三 15:00」；只有日期就不带时刻。"""
+    s = (value or "").strip()
+    if not s:
+        return ""
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        wd = _WEEKDAYS[dt.weekday()]
+        if dt.hour or dt.minute:
+            return f"{dt:%Y-%m-%d} 周{wd} {dt:%H:%M}"
+        return f"{dt:%Y-%m-%d} 周{wd}"
+    except Exception:  # noqa: BLE001
+        return s[:16].replace("T", " ")
+
+
+def _scene_label(scope: str, session_id: str = "") -> str:
+    """场景 + 人物：私聊带对方号，群聊带群号。"""
+    sc = (scope or "").strip()
+    if sc.startswith("group:"):
+        return "群 " + sc.split(":", 1)[1]
+    if sc == "private":
+        tail = (session_id or "").rsplit(":", 1)[-1]
+        return ("私聊 · " + tail) if tail.isdigit() else "私聊"
+    return sc or "场景未知"
+
+
+def _sort_mode(value: str) -> str:
+    s = (value or "relevance").strip().lower()
+    s = {"按时间": "time", "时间": "time",
+         "相关": "relevance", "相关度": "relevance"}.get(s, s)
+    return s if s in ("relevance", "time") else ""
+
+
+def _group_send_capped(cap, used) -> bool:
+    """群聊主动发话的每日上限；cap<=0 表示不限。"""
+    try:
+        cap = int(cap)
+    except (TypeError, ValueError):
+        cap = 2
+    try:
+        used = int(used)
+    except (TypeError, ValueError):
+        used = 0
+    return cap > 0 and used >= cap
+
+
+def _session_map(store, episode_ids) -> dict[int, str]:
+    ids = sorted({int(x) for x in episode_ids if x})
+    if not ids:
+        return {}
+    marks = ",".join("?" for _ in ids)
+    return {
+        int(r["id"]): (r["session_id"] or "")
+        for r in store.conn.execute(
+            f"SELECT id, session_id FROM episode WHERE id IN ({marks})", ids)
+    }
+
+
+def _filter_series_members(members: list[dict], since: str = "", until: str = "",
+                           limit: int = 30, query: str = "") -> tuple[list[dict], int]:
+    """按日期/关键词过滤系列成员；返回（要显示的，过滤后总数）。limit<=0 表示全部。"""
+    def day(m):
+        return str(m.get("anchor_time") or m.get("created_at")
+                   or m.get("event_time") or "")[:10]
+    q = (query or "").strip().casefold()
+    toks = [t for t in q.split() if t]
+    out = []
+    for m in members:
+        d = day(m)
+        if since and (not d or d < since):
+            continue
+        if until and (not d or d > until):
+            continue
+        if toks:
+            text = str(m.get("text") or "").casefold()
+            if not all(t in text for t in toks):
+                continue
+        out.append(m)
+    total = len(out)
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = 30
+    if n > 0:
+        out = out[:n]
+    return out, total
+
+
 
 WANDER_SYSTEM = (
     "你没有被安排任务。你只是醒了一下，翻到了一些自己的记忆。\n"
     "下面有：你对自己的认识（核心层）、你最近几次醒来时想过什么、以及一条旧记忆。\n"
     "你可以说一句话，也可以什么都不说。沉默是正常的，不需要找理由开口。\n"
-    "你现在在 QQ 上，对面是你正在说话的人。如果开口，这句话是对她说的，不是自言自语；\n"
+    "你现在在 QQ 上，对面是婉清。如果开口，这句话是对她说的，不是自言自语；\n"
     "不要讲系统、记忆机制、插件这些实现细节，除非这件事跟她本人有关。\n"
     "只输出 JSON，不要别的内容：\n"
     '{"decision":"speak 或 silent","source_trace":记忆编号(整数),'
@@ -62,7 +154,7 @@ def build_wander_prompt(core, reflections, memory) -> str:
         parts.append(f"【这次翻到的旧记忆 #{memory.get('id')}（{memory.get('kind')}/{memory.get('st')}）】\n"
                      f"{memory.get('text','')}")
     import time as _t
-    parts.append(f"现在是 {_t.strftime('%Y-%m-%d %H:%M')}。你要对对方说一句吗？还是不说？只输出 JSON。")
+    parts.append(f"现在是 {_t.strftime('%Y-%m-%d %H:%M')}。你要对婉清说一句吗？还是不说？只输出 JSON。")
     return "\n\n".join(parts)
 
 
@@ -148,6 +240,7 @@ class DafeiyuMemory(Star):
         self._due_task: asyncio.Task | None = None
         self._topics_done: str = ""
         self._last_imp: dict[str, tuple[float, str]] = {}
+        self._last_recall: dict[str, dict] = {}
 
     # ---------- 基础 ----------
 
@@ -304,16 +397,16 @@ class DafeiyuMemory(Star):
                     prov = None
                 if prov is None:
                     prov = self.context.get_using_provider(umo=session)
+                if prov is None:
+                    logger.warning(
+                        f"[memory] 没有可用的对话模型，{len(lines)} 行退回缓冲稍后再试"
+                    )
+                    store.restore_pending(line_ids)
+                    return 0
                 items, updates = await archivist.extract(prov, lines, store)
                 n = archivist.write_items(store, items, lines, scope, session)
                 item_texts = [i["text"] for i in items]
-                for u in updates:
-                    try:
-                        archivist.settle_with_fact(
-                            store, int(u["id"]), u["state"], u.get("note") or "",
-                            item_texts, session)
-                    except Exception:
-                        pass
+                archivist.apply_updates(store, updates, item_texts, session)
                 facts = [i["text"] for i in items if i["kind"] in ("fact", "observation")]
                 if facts:
                     await archivist.resolve_conflicts(store, facts, prov, session,
@@ -329,7 +422,14 @@ class DafeiyuMemory(Star):
                 return n
             except Exception as e:  # noqa: BLE001
                 try:
-                    logger.exception(f"[memory] 提炼落库出错：{type(e).__name__}: {e}")
+                    if isinstance(e, archivist.ParseError):
+                        logger.warning(
+                            f"[memory] 提炼返回空/坏结果，{len(lines)} 行退回缓冲稍后再试：{e}"
+                        )
+                    else:
+                        logger.exception(
+                            f"[memory] 提炼落库出错：{type(e).__name__}: {e}"
+                        )
                 except Exception:
                     logger.error(f"[memory] 提炼落库出错：{type(e).__name__}: {e}")
                 try:
@@ -766,7 +866,7 @@ class DafeiyuMemory(Star):
                     st.close()
                 # 顺手清掉过期的原话
                 try:
-                    days = int(self._cfg("raw_retention_days", 90) or 0)
+                    days = int(self._cfg("raw_retention_days", 0) or 0)
                     st2 = Store(self.db_path)
                     try:
                         n = st2.raw_purge(days)
@@ -916,6 +1016,64 @@ class DafeiyuMemory(Star):
         finally:
             st.close()
 
+    # ---------- 她自己放的常驻区 ----------
+
+    def _resident_scope_keys(self, event) -> list[str]:
+        return resident.scope_keys(event)
+
+    def _resolve_resident_scope(self, event, scope: str) -> str:
+        return resident.resolve_scope(event, scope)
+
+    def _resident_block(self, event) -> str:
+        return resident.render(self._db().resident_active(self._resident_scope_keys(event)))
+
+    def _push_resident(self, req, event) -> int:
+        block = self._resident_block(event)
+        if not block:
+            return 0
+        parts = list(getattr(req, "extra_user_content_parts", []) or [])
+        if any("【你自己放在常驻区的】" in (getattr(p, "text", "") or "") for p in parts):
+            return 0
+        base = getattr(req, "system_prompt", "") or ""
+        if "【你自己放在常驻区的】" in base:
+            return 0
+        try:
+            from astrbot.core.agent.message import TextPart
+
+            part = TextPart(text=block)
+            if hasattr(part, "mark_as_temp"):
+                part.mark_as_temp()
+            req.extra_user_content_parts = parts
+            req.extra_user_content_parts.append(part)
+        except Exception:  # noqa: BLE001
+            req.system_prompt = (base + "\n\n" + block).strip()
+        return len(block)
+
+    # ---------- 她自己分的系列 ----------
+
+    def _series_scope(self, event, scope: str) -> str:
+        s = (scope or "auto").strip().lower()
+        if s in ("auto", "自动", "当前", "这里"):
+            gid = str(event.get_group_id() or "")
+            if gid:
+                return "group:" + gid
+            sid = str(event.get_sender_id() or "")
+            if sid:
+                return "private:" + sid
+            return "global"
+        return resident.resolve_scope(event, s)
+
+    @staticmethod
+    def _series_scope_label(scope: str) -> str:
+        sc = (scope or "").strip()
+        if sc == "global":
+            return "全局"
+        if sc.startswith("group:"):
+            return "群 " + sc.split(":", 1)[1]
+        if sc.startswith("private:"):
+            return "私聊 · " + sc.split(":", 1)[1]
+        return sc or "未知场景"
+
     def _configure_embedding(self) -> None:
         """把配置里的向量服务交给 retriever，并做一次健康检查（只做一次）。"""
         try:
@@ -984,6 +1142,13 @@ class DafeiyuMemory(Star):
                     logger.info(f"[memory] 注入更正 {len(fixes)} 条")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[memory] 注入更正出错：{type(e).__name__}: {e}")
+        # 她自己放的常驻区：原样递回去，不筛选、不总结
+        try:
+            _n = self._push_resident(req, event)
+            if _n:
+                logger.info(f"[memory] 常驻区注入 {_n} 字（她自己放的）")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[memory] 注入常驻区出错：{type(e).__name__}: {e}")
         # 可能相关的挂起项：她这句话也许和某条约定有关，递给她自己判断
         try:
             _text = (event.message_str or "").strip()
@@ -1072,16 +1237,138 @@ class DafeiyuMemory(Star):
         if "【记忆】" in base:
             return
         note = ("\n\n【记忆】\n"
-                "你有自己的记忆库：recall_memory 翻内容、recall_day 按天回想、"
-                "memory_directory 看目录、read_memory 深读一条、list_unresolved 看没办完的事、"
-                "settle_memory 给挂着的约定/未了收尾、tag_memory 给旧记忆起名、"
-                "avoid_memory 标记不想提的事。\n")
+                "你有自己的记忆库：recall_memory 翻内容、sort_last_recall 重排刚才那批、"
+                "recall_day 按天回想、memory_directory 看目录、read_memory 深读一条、"
+                "list_unresolved 看没办完的事、settle_memory 给挂着的约定/未了收尾、"
+                "tag_memory 给旧记忆起名、avoid_memory 标记不想提的事。\n"
+                "系列是你自己分的：series_create 建一个、series_rename 改名、series_add 把几次发生放进去、"
+                "series_list 看有哪些、series_show 展开；系列只加链接，不改正文、不删记忆。\n")
         req.system_prompt = base + note
+
+    # ---------- 刚才那批的重排 ----------
+
+    def _remember_recall(self, event, hits) -> None:
+        try:
+            key = str(getattr(event, "unified_msg_origin", "") or "default")
+            cache = getattr(self, "_last_recall", None)
+            if cache is None:
+                cache = {}
+                self._last_recall = cache
+            if len(cache) >= 20 and key not in cache:
+                cache.pop(next(iter(cache)), None)
+            cache[key] = {"hits": list(hits), "at": time.time()}
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _last_recall_hits(self, event):
+        try:
+            key = str(getattr(event, "unified_msg_origin", "") or "default")
+            cache = getattr(self, "_last_recall", {}) or {}
+            entry = cache.get(key)
+            if not entry:
+                return None
+            if time.time() - float(entry.get("at") or 0) > 1800:
+                cache.pop(key, None)
+                return None
+            return list(entry.get("hits") or [])
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _render_hits(self, store, hits, title: str, order_label: str, sort_mode: str) -> str:
+        if not hits:
+            return title + "\n（没有）"
+        # 旁注里有「被事实纠正过」这类信息，回想时一并给她看（只读，不改正文）
+        notes: dict[int, list[str]] = {}
+        her_words: dict[int, str] = {}
+        her_quotes: dict[int, str] = {}
+        ids = [int(h["id"]) for h in hits]
+        try:
+            if ids:
+                q = ",".join("?" * len(ids))
+                for r in store.conn.execute(
+                        f"SELECT trace_id, kind, text FROM trace_note WHERE trace_id IN ({q}) ORDER BY id", ids):
+                    if (r["kind"] or "") == "her_words":
+                        her_words[int(r["trace_id"])] = r["text"]
+                    elif (r["kind"] or "") == "quote":
+                        her_quotes[int(r["trace_id"])] = r["text"]
+                    else:
+                        notes.setdefault(int(r["trace_id"]), []).append(r["text"])
+        except Exception:  # noqa: BLE001
+            notes = {}
+
+        marks = ",".join("?" for _ in ids)
+        metas = {
+            int(r["id"]): r
+            for r in store.conn.execute(
+                f"SELECT id, created_at, episode_id, scope FROM trace WHERE id IN ({marks})",
+                ids)
+        }
+        sessions = _session_map(store, [m["episode_id"] for m in metas.values()])
+        if sort_mode == "time":
+            def _when_key(h):
+                meta = metas.get(int(h["id"]))
+                return str(h.get("anchor_time") or (meta["created_at"] if meta else "") or "")
+            hits = sorted(hits, key=_when_key)
+        else:
+            hits = sorted(hits, key=lambda h: -float(h.get("score") or 0))
+
+        lines = []
+        for h in hits:
+            meta = metas.get(int(h["id"]))
+            created = str(meta["created_at"] or "") if meta else ""
+            eid = int(meta["episode_id"] or 0) if meta else 0
+            scope = str(meta["scope"] or "") if meta else str(h.get("scope") or "")
+            when_raw = h.get("anchor_time") or created
+            when = _fmt_when(when_raw)
+            if when and not h.get("anchor_time"):
+                when += "（记下）"
+            scene = _scene_label(scope, sessions.get(eid, ""))
+            header = " · ".join(x for x in (order_label, when, scene) if x)
+            if lines:
+                lines.append("")
+            if header:
+                lines.append(header)
+            st = h.get("state") or "open"
+            mark = {"open": "", "void": "（已作废）", "missed": "（过点了）",
+                    "stale": "（久了，没再提）", "old": "（很久没提了）",
+                    "dormant": "（休眠了）"}.get(st, "（已了结）")
+            line = f"#{h['id']} [{h['kind']}]{mark} {h['text']}"
+            mine = her_words.get(int(h["id"]))
+            if mine:
+                line += f"\n    ｜我的话：{mine[:120]}"
+            extra = notes.get(int(h["id"])) or []
+            if h.get("felt"):
+                line += f"\n    ｜当时感觉：{h['felt']}"
+            if h.get("reaction"):
+                line += f"\n    ｜我的反应：{h['reaction']}"
+            if her_quotes.get(int(h["id"])):
+                line += f"\n    ｜原话（她留的）：「{her_quotes[int(h['id'])][:80]}」"
+            elif h.get("anchor_quote"):
+                line += f"\n    ｜原话：「{h['anchor_quote'][:80]}」"
+            if h.get("inference"):
+                c = h.get("inference_certainty")
+                line += f"\n    ｜推断（{c:.1f}）：{h['inference']}" if isinstance(c, (int, float)) else f"\n    ｜推断：{h['inference']}"
+            if extra:
+                line += "\n    ｜旁注：" + "；".join(x[:60] for x in extra[:2])
+            gs = int(h.get("group_size") or 1)
+            label = str(h.get("group_label") or "")
+            if gs > 1 or label:
+                first = _fmt_when(str(h.get("group_first") or ""))
+                last = _fmt_when(str(h.get("group_last") or ""))
+                bits = []
+                if first:
+                    bits.append("最早 " + first)
+                if last and last != first:
+                    bits.append("最近 " + last)
+                prefix = f"｜系列「{label}」" if label else "｜同系列"
+                line += f"\n    {prefix}：共 {gs} 条" + (f"（{'，'.join(bits)}）" if bits else "")
+            lines.append(line)
+        return title + "\n" + "\n".join(lines)
 
     @filter.llm_tool(name="recall_memory")
     async def recall_memory(self, event: AstrMessageEvent, query: str = "", kind: str = "",
                             limit: int = 5, since: str = "", until: str = "",
-                            scope: str = "", person: str = ""):
+                            scope: str = "", person: str = "", sort: str = "relevance"):
         '''翻你自己的记忆。想知道某件事、某个人、某个约定时用。
         返回的是「材料」（当时的记录），不是答案——用你自己的话回想，不要照抄。
 
@@ -1092,7 +1379,8 @@ class DafeiyuMemory(Star):
             since(string): 可选，只看这之后：2026-11-10 / 昨天 / 最近3天 / 7天前
             until(string): 可选，只看这之前：2026-11-12 / 今天
             scope(string): 可选，场景：私聊 / 群聊 / 群:123456
-            person(string): 可选，关于谁：某人 / 阿岚（按正文和主题词匹配）
+            person(string): 可选，关于谁：婉清 / 群友A / 群友B（按正文和主题词匹配）
+            sort(string): 排序：relevance（默认，按相关度）/ time（按时间，早→晚）
         '''
         try:
             store = self._db()
@@ -1112,66 +1400,42 @@ class DafeiyuMemory(Star):
                 self._search_in_thread, query or "", int(limit or 5), kind or "",
                 since_d or "", until_d or "", scope_f or "", person_f)
         except Exception as e:  # noqa: BLE001
+            logger.warning(f"[memory] recall_memory 出错：{type(e).__name__}: {e}", exc_info=True)
             return f"翻不动：{type(e).__name__}"
         if not hits:
             return "没找到相关的。"
+        sort_mode = _sort_mode(sort)
+        if not sort_mode:
+            return "排序没看懂。写 relevance（按相关度）或 time（按时间，早→晚）。"
         for h in hits[:3]:
             try:
                 store.activate(h["id"], cue_type="recall", query=query or "")
             except Exception:
                 pass
-        # 旁注里有「被事实纠正过」这类信息，回想时一并给她看（只读，不改正文）
-        notes: dict[int, list[str]] = {}
-        her_words: dict[int, str] = {}
-        her_quotes: dict[int, str] = {}
-        try:
-            ids = [int(h["id"]) for h in hits]
-            if ids:
-                q = ",".join("?" * len(ids))
-                for r in store.conn.execute(
-                        f"SELECT trace_id, kind, text FROM trace_note WHERE trace_id IN ({q}) ORDER BY id", ids):
-                    if (r["kind"] or "") == "her_words":
-                        her_words[int(r["trace_id"])] = r["text"]
-                    elif (r["kind"] or "") == "quote":
-                        her_quotes[int(r["trace_id"])] = r["text"]
-                    else:
-                        notes.setdefault(int(r["trace_id"]), []).append(r["text"])
-        except Exception:
-            notes = {}
+        self._remember_recall(event, hits)
+        order_label = "按时间" if sort_mode == "time" else "相关"
+        title = "材料（按时间排，早→晚）：" if sort_mode == "time" else "材料（按相关度排）："
+        return self._render_hits(store, hits, title, order_label, sort_mode)
 
-        lines = []
-        for h in hits:
-            when = (h.get("anchor_time") or "")[:10]
-            st = h.get("state") or "open"
-            mark = {"open": "", "void": "（已作废）", "missed": "（过点了）",
-                    "stale": "（久了，没再提）", "old": "（很久没提了）",
-                    "dormant": "（休眠了）"}.get(st, "（已了结）")
-            sc = (h.get("scope") or "") if hasattr(h, "get") else ""
-            label = ""
-            if sc.startswith("group:"):
-                label = "〔群聊 " + sc.split(":", 1)[1] + "〕"
-            elif sc == "private":
-                label = "〔私聊〕"
-            mine = her_words.get(int(h["id"]))
-            if mine:
-                lines.append(f"    ｜我的话：{mine[:120]}")
-            line = f"#{h['id']} {label}[{h['kind']}]{mark} {h['text']}" + (f"（{when}）" if when else "")
-            extra = notes.get(int(h["id"])) or []
-            if h.get("felt"):
-                line += f"\n    ｜当时感觉：{h['felt']}"
-            if h.get("reaction"):
-                line += f"\n    ｜我的反应：{h['reaction']}"
-            if her_quotes.get(int(h["id"])):
-                line += f"\n    ｜原话（她留的）：「{her_quotes[int(h['id'])][:80]}」"
-            elif h.get("anchor_quote"):
-                line += f"\n    ｜原话：「{h['anchor_quote'][:80]}」"
-            if h.get("inference"):
-                c = h.get("inference_certainty")
-                line += f"\n    ｜推断（{c:.1f}）：{h['inference']}" if isinstance(c, (int, float)) else f"\n    ｜推断：{h['inference']}"
-            if extra:
-                line += "\n    ｜旁注：" + "；".join(x[:60] for x in extra[:2])
-            lines.append(line)
-        return "材料：\n" + "\n".join(lines)
+    @filter.llm_tool(name="sort_last_recall")
+    async def sort_last_recall(self, event: AstrMessageEvent, sort: str = "time"):
+        """把刚才 recall_memory 返回的那批结果重新排，不重新搜、不重新算向量。
+
+        什么时候用：你刚搜过，觉得顺序不对，想按时间或相关度再看一遍。
+        没有刚才那批时不要用，先 recall_memory。
+
+        Args:
+            sort(string): time（按时间早→晚，默认）/ relevance（按相关度）
+        """
+        hits = self._last_recall_hits(event)
+        if not hits:
+            return "刚才没有检索过，或者那批太久了；先 recall_memory 搜一次，再重排。"
+        mode = _sort_mode(sort)
+        if not mode:
+            return "排序没看懂。写 relevance（按相关度）或 time（按时间，早→晚）。"
+        title = "刚才那批（按时间排，早→晚）：" if mode == "time" else "刚才那批（按相关度排）："
+        order_label = "按时间" if mode == "time" else "相关"
+        return self._render_hits(self._db(), hits, title, order_label, mode)
 
     @filter.llm_tool(name="send_group_message")
     async def send_group_message(self, event: AstrMessageEvent, text: str = "", group: str = ""):
@@ -1215,18 +1479,12 @@ class DafeiyuMemory(Star):
             session = origin
             gid = origin.rsplit(":", 1)[-1]
         allow = str(self._cfg("group_send_allow", "") or "").strip()
-        if not allow:
-            return "群发白名单没配，先别在群里主动说。"
         if allow:
             ids = {x.strip() for x in allow.replace("，", ",").split(",") if x.strip()}
             if gid not in ids:
                 return "这个群不在允许主动发话的名单里。"
         if self._quiet_hours(str(self._cfg("group_send_quiet_hours", "1-7") or "")):
             return "现在是静默时段，不主动发。"
-        try:
-            cap = int(self._cfg("group_send_max_per_day", 2))
-        except Exception:
-            cap = 2
         import datetime as _dt
         key = f"group_send:{gid}:{_dt.date.today().isoformat()}"
         try:
@@ -1234,7 +1492,7 @@ class DafeiyuMemory(Star):
             used = int(st.kv_get(key) or 0)
         except Exception:
             used = 0
-        if used >= cap:
+        if _group_send_capped(self._cfg("group_send_max_per_day", 2), used):
             return f"这个群今天已经主动说过 {used} 次了，先不说。"
         try:
             from astrbot.api.event import MessageChain
@@ -1317,6 +1575,227 @@ class DafeiyuMemory(Star):
         except Exception as e:  # noqa: BLE001
             return f"没写上：{type(e).__name__}"
         return "写进核心层了。"
+
+    @filter.llm_tool(name="resident_add")
+    async def resident_add(self, event: AstrMessageEvent, text: str, scope: str = "global"):
+        """把你想要一直摆在眼前的一件事，放进你自己的常驻区。
+
+        什么时候用：有些事你不想只靠回想，想每轮都看到——正在等的、约好的、
+        提醒自己的、怕自己忘的。放什么、撤什么由你定，系统不替你挑。
+        常驻区最多 12 条、1200 字；满了会拒绝，先 resident_retire 一条。
+
+        Args:
+            text(string): 你自己写的一句话，尽量短
+            scope(string): global（所有会话）/ private（只在这个私聊）/ group（只在这个群）
+        """
+        try:
+            sc = self._resolve_resident_scope(event, scope)
+            nid = self._db().resident_add(text, sc)
+        except Exception as e:  # noqa: BLE001
+            return f"没放进去：{e}"
+        return f"放好了，常驻 #{nid}（{sc}）。"
+
+    @filter.llm_tool(name="resident_retire")
+    async def resident_retire(self, event: AstrMessageEvent, note_id: int):
+        """从你自己的常驻区撤掉一条（不删除，只标已撤）。
+
+        Args:
+            note_id(int): 常驻区的编号
+        """
+        try:
+            ok = self._db().resident_retire(int(note_id))
+        except Exception as e:  # noqa: BLE001
+            return f"没撤成：{type(e).__name__}"
+        if not ok:
+            return f"#{int(note_id)} 不在常驻区，或者已经撤了。"
+        return f"撤掉了 #{int(note_id)}。"
+
+    @filter.llm_tool(name="resident_list")
+    async def resident_list(self, event: AstrMessageEvent):
+        """看看你自己的常驻区现在放着什么（只看当前会话能看到的）。"""
+        try:
+            rows = self._db().resident_active(self._resident_scope_keys(event))
+        except Exception as e:  # noqa: BLE001
+            return f"翻不动：{type(e).__name__}"
+        if not rows:
+            return "常驻区现在是空的。你可以用 resident_add 放一条。"
+        out = []
+        for r in rows:
+            sc = str(r.get("scope") or "global")
+            label = "全局" if sc == "global" else ("这个群" if sc.startswith("group:") else "这个私聊")
+            out.append(f"#{r['id']} [{label}] {r['text']}")
+        return "\n".join(out)
+
+    @filter.llm_tool(name="series_create")
+    async def series_create(self, event: AstrMessageEvent, name: str = "",
+                            scope: str = "auto", note: str = ""):
+        """给你自己分一个「系列」：一类反复发生的事，不是一个记忆。
+
+        系列只是把几次发生挂在一起，不改正文、不删原文、不合并成一句。
+        建好后用 series_add 把记忆放进去；检索时会按系列折叠成一条代表。
+
+        Args:
+            name(string): 系列名，比如「每天叫他起床」
+            scope(string): auto（当前场景，默认）/ global（所有会话）/ private（这个私聊）/ group（这个群）
+            note(string): 可选，一句说明
+        """
+        if not (name or "").strip():
+            return "系列名是空的。先想一个名字，比如「每天叫他起床」。"
+        try:
+            sc = self._series_scope(event, scope)
+            sid = self._db().series_create(name, sc, note)
+        except Exception as e:  # noqa: BLE001
+            return f"系列没建成：{e}"
+        return f"系列 #{sid}「{name.strip()}」建好了（{self._series_scope_label(sc)}）。用 series_add 把记忆放进去。"
+
+    @filter.llm_tool(name="series_rename")
+    async def series_rename(self, event: AstrMessageEvent, series_id: int = 0,
+                            name: str = ""):
+        """给系列改个名字（只改名字，不动成员、不动记忆）。"""
+        if int(series_id or 0) <= 0 or not (name or "").strip():
+            return "要说清楚：series_rename 需要系列编号和新名字。"
+        try:
+            st = self._db()
+            cur = st.conn.execute(
+                "UPDATE memory_series SET name=? WHERE id=? AND status='active'",
+                ((name or "").strip()[:60], int(series_id)))
+            st.conn.commit()
+        except Exception as e:  # noqa: BLE001
+            return f"没改成：{type(e).__name__}"
+        if not cur.rowcount:
+            return "没有这个系列，或者已经撤了。"
+        return f"系列 #{int(series_id)} 改名为「{(name or '').strip()[:60]}」；成员没动。"
+
+    @filter.llm_tool(name="series_add")
+    async def series_add(self, event: AstrMessageEvent, series_id: int = 0,
+                         memory_ids: str = ""):
+        """把几条记忆放进你自己的系列里（只加链接，不改正文、不删除）。
+
+        一条记忆可以同时放进多个系列；同一个系列重复放只算一次。
+
+        Args:
+            series_id(int): 系列编号
+            memory_ids(string): 记忆编号，逗号/空格分隔，比如 "123,124,125"
+        """
+        import re as _re
+        if int(series_id or 0) <= 0:
+            return "要放进哪个系列？先用 series_list 看编号，再 series_add。"
+        ids = []
+        for x in _re.split(r"[,，、\s]+", str(memory_ids or "")):
+            x = x.strip().lstrip("#")
+            if x.isdigit():
+                ids.append(int(x))
+        if not ids:
+            return "没看懂要放哪些记忆。写编号，比如 123,124。"
+        ok, errors = 0, []
+        for tid in ids[:50]:
+            try:
+                if self._db().series_add(int(series_id), tid):
+                    ok += 1
+            except Exception as e:  # noqa: BLE001
+                errors.append(str(e))
+        if ok and not errors:
+            return f"放进系列 #{int(series_id)} 了：{ok} 条。"
+        if ok:
+            return f"放进 {ok} 条；还有 {len(errors)} 条没放：{'；'.join(errors[:3])}"
+        return "一条都没放进去：" + "；".join(errors[:3])
+
+    @filter.llm_tool(name="series_remove")
+    async def series_remove(self, event: AstrMessageEvent, series_id: int = 0,
+                            memory_id: int = 0):
+        """从系列里拿掉一条记忆（只解除链接，记忆本身不删）。"""
+        if int(series_id or 0) <= 0 or int(memory_id or 0) <= 0:
+            return "要说清楚：series_remove 需要系列编号和记忆编号。"
+        try:
+            ok = self._db().series_remove(int(series_id), int(memory_id))
+        except Exception as e:  # noqa: BLE001
+            return f"没拿掉：{type(e).__name__}"
+        return f"从系列 #{int(series_id)} 拿掉了 #{int(memory_id)}。" if ok else "这条不在这个系列里。"
+
+    @filter.llm_tool(name="series_retire")
+    async def series_retire(self, event: AstrMessageEvent, series_id: int = 0):
+        """撤掉整个系列（只撤系列，记忆和它们的正文都还在）。"""
+        if int(series_id or 0) <= 0:
+            return "要撤哪个系列？给编号，先用 series_list 看一下。"
+        try:
+            ok = self._db().series_retire(int(series_id))
+        except Exception as e:  # noqa: BLE001
+            return f"没撤成：{type(e).__name__}"
+        return f"系列 #{int(series_id)} 撤了；里面的记忆没删。" if ok else "没有这个系列，或者已经撤了。"
+
+    @filter.llm_tool(name="series_list")
+    async def series_list(self, event: AstrMessageEvent):
+        """看看你自己建了哪些系列（只看当前场景能看到的）。"""
+        try:
+            rows = self._db().series_list(self._resident_scope_keys(event))
+        except Exception as e:  # noqa: BLE001
+            return f"翻不动：{type(e).__name__}"
+        if not rows:
+            return "还没有系列。可以用 series_create 建一个。"
+        lines = ["你自己分的系列："]
+        for r in rows:
+            when = _fmt_when(str(r.get("last_added") or ""))
+            tail = f"，最近放入 {when}" if when else ""
+            lines.append(
+                f"#{r['id']}「{r['name']}」· {self._series_scope_label(r['scope'])}"
+                f" · {int(r['n'] or 0)} 条{tail}")
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="series_show")
+    async def series_show(self, event: AstrMessageEvent, series_id: int = 0,
+                          since: str = "", until: str = "", limit: int = 30,
+                          query: str = ""):
+        """看一个系列里有哪些发生（按时间排，正文原样）。
+
+        Args:
+            series_id(int): 系列编号
+            since(string): 可选，只看这之后：2026-11-10 / 昨天 / 最近3天 / 7天前
+            until(string): 可选，只看这之前：2026-11-12 / 今天
+            limit(int): 最多显示几条，默认 30；0 = 全部
+            query(string): 可选，只在系列里按关键词找（多个词用空格，要求都出现）
+        """
+        if int(series_id or 0) <= 0:
+            return "要看哪个系列？给编号，先用 series_list 看一下。"
+        since_d = _date_bound(since)
+        until_d = _date_bound(until)
+        if since_d is None or until_d is None:
+            return "时间没看懂。写 2026-11-10、昨天、最近3天、7天前 这种。"
+        if since_d and until_d and since_d > until_d:
+            return "开始时间比结束时间晚，倒过来了。"
+        try:
+            s = self._db().series_show(int(series_id))
+        except Exception as e:  # noqa: BLE001
+            return f"翻不动：{type(e).__name__}"
+        if not s:
+            return "没有这个系列。"
+        if s.get("scope") != "global" and s.get("scope") not in self._resident_scope_keys(event):
+            return "这个系列不在当前场景，看不了。"
+        all_members = s["members"]
+        # 以对话时间（anchor_time）为准排序：event_time 是提炼时估的，可能错年错月
+        all_members = sorted(
+            all_members,
+            key=lambda m: str(m.get("anchor_time") or m.get("created_at")
+                              or m.get("event_time") or ""))
+        members, total = _filter_series_members(all_members, since_d, until_d, limit, query)
+        head = (f"系列 #{s['id']}「{s['name']}」· {self._series_scope_label(s['scope'])}"
+                f" · 共 {len(all_members)} 条")
+        bits = []
+        if since_d or until_d:
+            bits.append(f"{since_d or '开始'}–{until_d or '现在'}")
+        if (query or "").strip():
+            bits.append(f"关键词「{query.strip()}」")
+        if bits:
+            head += f"（筛选 {'，'.join(bits)}，{total} 条）"
+        lines = [head + "："]
+        if not members:
+            lines.append("（没有符合条件的）")
+        for m in members:
+            when = _fmt_when(str(m.get("anchor_time") or m.get("created_at")
+                                  or m.get("event_time") or ""))
+            lines.append(f"{when} · #{m['id']} [{m['kind']}] {m['text']}")
+        if 0 < len(members) < total:
+            lines.append(f"（只显示前 {len(members)} 条，还有 {total - len(members)} 条；limit=0 看全部）")
+        return "\n".join(lines)
 
     @filter.llm_tool(name="recall_day")
     async def recall_day(self, event: AstrMessageEvent, day: str = "今天"):
@@ -1497,16 +1976,31 @@ class DafeiyuMemory(Star):
         try:
             store = self._db()
             rows = store.conn.execute(
-                """SELECT t.id, t.kind, v.text FROM trace t JOIN trace_version v ON v.id=t.head_version_id
+                """SELECT t.id, t.kind, v.text, t.created_at, t.due_at, t.scope, t.episode_id
+                   FROM trace t JOIN trace_version v ON v.id=t.head_version_id
                    WHERE t.kind IN ('unresolved','promise') AND t.status='active'
                      AND COALESCE(t.state,'open') IN ('open','missed')
-                   ORDER BY t.id DESC LIMIT 8""")
-            items = [(r["id"], r["kind"], r["text"]) for r in rows]
+                   ORDER BY t.id DESC LIMIT 8""").fetchall()
         except Exception as e:  # noqa: BLE001
             return f"翻不动：{type(e).__name__}"
-        if not items:
+        if not rows:
             return "没有未了的事。"
-        return "\n".join(f"#{i} [{k}] {t}" for i, k, t in items)
+        sessions = _session_map(store, [r["episode_id"] for r in rows])
+        lines = []
+        for r in rows:
+            due = str(r["due_at"] or "")
+            when = _fmt_when(due or r["created_at"])
+            if when:
+                when = ("到期 " + when) if due else ("记下 " + when)
+            scene = _scene_label(str(r["scope"] or ""),
+                                 sessions.get(int(r["episode_id"] or 0), ""))
+            header = " · ".join(x for x in (when, scene) if x)
+            if lines:
+                lines.append("")
+            if header:
+                lines.append(header)
+            lines.append(f"#{r['id']} [{r['kind']}] {r['text']}")
+        return "\n".join(lines)
 
 
     @filter.llm_tool(name="review_loose_ends")
@@ -1519,7 +2013,8 @@ class DafeiyuMemory(Star):
         try:
             store = self._db()
             rows = store.conn.execute(
-                """SELECT t.id, t.kind, COALESCE(t.state,'open') AS st, v.text
+                """SELECT t.id, t.kind, t.created_at, t.scope, t.episode_id,
+                          COALESCE(t.state,'open') AS st, v.text
                    FROM trace t JOIN trace_version v ON v.id=t.head_version_id
                    WHERE t.kind IN ('unresolved','promise','agreement') AND t.status='active'
                      AND t.avoided=0
@@ -1529,8 +2024,16 @@ class DafeiyuMemory(Star):
             return f"翻不动：{type(e).__name__}"
         if not rows:
             return "没有沉下去的事。"
+        sessions = _session_map(store, [r["episode_id"] for r in rows])
         lines = ["这些一直没下文："]
         for r in rows:
+            when = _fmt_when(r["created_at"])
+            scene = _scene_label(str(r["scope"] or ""),
+                                 sessions.get(int(r["episode_id"] or 0), ""))
+            header = " · ".join(x for x in (("记下 " + when) if when else "", scene) if x)
+            if header:
+                lines.append("")
+                lines.append(header)
             tag = "旧事" if r["st"] == "old" else "沉默"
             lines.append(f"#{r['id']}（{tag}）[{r['kind']}] {r['text'][:80]}")
         lines.append("想放下哪件，就用 settle_memory 了结；还惦记就留着，不用现在决定。")

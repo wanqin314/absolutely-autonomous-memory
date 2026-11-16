@@ -395,39 +395,81 @@ def _norm(t: str) -> str:
 
 
 def _collapse_similar(hits: list[dict], store=None) -> list[dict]:
-    """结果里同一件事只留一条（保留分最高的）：字面像，或向量像。
+    """结果里同一件事/同一系列只留一条代表，其余折叠成计数。
 
     只在最前面的 60 条里做，向量一次性读出来——不然条数一多会变成 O(n²) 查库。
+    代表条目带 group_size / group_ids / group_first / group_last，检索层显示
+    「同系列共 N 条」，不把这些发生从库里删掉。
     """
     import difflib
 
     hits = hits[:60]
     vecs: dict[int, list[float]] = {}
+    series_map: dict[int, dict] = {}
+    ids = [int(h["id"]) for h in hits]
     if store is not None:
         try:
-            ids = [int(h["id"]) for h in hits]
             q = ",".join("?" * len(ids))
             for r in store.conn.execute(f"SELECT trace_id, vec FROM trace_vec WHERE trace_id IN ({q})", ids):
                 vecs[int(r["trace_id"])] = unpack(r["vec"])
         except Exception:
             vecs = {}
+        try:
+            series_map = store.series_for_traces(ids)
+        except Exception:
+            series_map = {}
 
     kept: list[dict] = []
     for h in hits:
         hn = _norm(h["text"])
-        dup = False
-        for k in kept:
-            if k["kind"] != h["kind"]:
-                continue
-            if difflib.SequenceMatcher(None, hn, _norm(k["text"])).ratio() >= 0.8:
-                dup = True
-                break
-            a, b = vecs.get(int(h["id"])), vecs.get(int(k["id"]))
-            if a and b and cosine(a, b) >= 0.88:
-                dup = True
-                break
-        if not dup:
-            kept.append(h)
+        sid = int((series_map.get(int(h["id"])) or {}).get("id") or 0)
+        sname = str((series_map.get(int(h["id"])) or {}).get("name") or "")
+        h["series_id"] = sid
+        h["series_name"] = sname
+        dup = None
+        if sid:
+            for k in kept:
+                if int(k.get("series_id") or 0) == sid:
+                    dup = k
+                    break
+        else:
+            for k in kept:
+                if k.get("series_id"):
+                    continue
+                if k["kind"] != h["kind"]:
+                    continue
+                if (k.get("scope") or "") != (h.get("scope") or ""):
+                    continue
+                if difflib.SequenceMatcher(None, hn, _norm(k["text"])).ratio() >= 0.8:
+                    dup = k
+                    break
+                a, b = vecs.get(int(h["id"])), vecs.get(int(k["id"]))
+                if a and b and cosine(a, b) >= 0.88:
+                    dup = k
+                    break
+        if dup is not None:
+            dup["group_size"] = int(dup.get("group_size") or 1) + 1
+            dup.setdefault("group_ids", [int(dup["id"])]).append(int(h["id"]))
+            if sid:
+                dup["group_label"] = sname
+                dup["group_kind"] = "series"
+            t = str(h.get("anchor_time") or "")
+            if t:
+                first = str(dup.get("group_first") or "")
+                last = str(dup.get("group_last") or "")
+                if not first or t < first:
+                    dup["group_first"] = t
+                if not last or t > last:
+                    dup["group_last"] = t
+            continue
+        h["group_size"] = 1
+        h["group_ids"] = [int(h["id"])]
+        h["group_first"] = str(h.get("anchor_time") or "")
+        h["group_last"] = str(h.get("anchor_time") or "")
+        if sid:
+            h["group_label"] = sname
+            h["group_kind"] = "series"
+        kept.append(h)
     return kept
 
 

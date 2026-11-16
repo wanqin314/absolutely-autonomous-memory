@@ -26,7 +26,7 @@ def main():
     assert items[0]["reaction"] == "没接话，去把碗收了", items
     assert items[0]["inference_certainty"] == 0.6, items
 
-    lines = [{"role": "user", "text": "不吃了", "sender": "某人",
+    lines = [{"role": "user", "text": "不吃了", "sender": "婉清",
               "created_at": datetime.now().isoformat(timespec="seconds")}]
     n = A.write_items(st, items, lines, "private", "sess")
     assert n == 1, n

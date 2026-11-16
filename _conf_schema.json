@@ -67,8 +67,8 @@
   "raw_retention_days": {
     "description": "原始对话保留多少天",
     "type": "int",
-    "default": 90,
-    "hint": "原话只追加、不进检索；填 0 表示永久保留。语音和图片只有占位，没有内容。"
+    "default": 0,
+    "hint": "原话只追加、不进检索；默认 0 = 永久保留，不自动删除。语音和图片只有占位，没有内容。"
   },
   "topics_review_enabled": {
     "description": "每晚让她给自己翻过的旧记忆起主题",
@@ -239,14 +239,15 @@
     "default": false
   },
   "group_send_allow": {
-    "description": "允许主动发话的群号，逗号分隔；空=不允许，需显式填写群号",
+    "description": "允许主动发话的群号，逗号分隔；空=全部",
     "type": "string",
     "default": ""
   },
   "group_send_max_per_day": {
     "description": "每个群每天最多主动几条",
     "type": "int",
-    "default": 2
+    "default": 0,
+    "hint": "0 = 不限；要限就填正整数"
   },
   "group_send_quiet_hours": {
     "description": "群聊主动发话的静默时段",
