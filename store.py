@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -24,6 +25,12 @@ KINDS = ("fact", "observation", "speculation", "self", "unresolved", "promise", 
 RESIDENT_MAX_ITEMS = 12
 RESIDENT_MAX_CHARS = 1200
 RESIDENT_MAX_ONE = 500
+
+
+def _quote_norm(text: str) -> str:
+    """原话比对用：去掉空白、标点和包裹引号，只留字。"""
+    s = str(text or "").strip().strip("「」『』“”\"'")
+    return re.sub(r"[\s，。！？、,.!?：:；;…—\-（）()\[\]【】]+", "", s)
 
 
 def _series_scope_compatible(trace_scope: str, series_scope: str) -> bool:
@@ -901,6 +908,31 @@ class Store:
             "SELECT e.transcript FROM trace t JOIN episode e ON e.id=t.episode_id WHERE t.id=?",
             (int(trace_id),)).fetchone()
         return (r["transcript"] if r and r["transcript"] else "") or ""
+
+    def anchor_quote_ok(self, trace_id: int, quote: str) -> bool:
+        """旧数据回看：原话能不能在 transcript 或原话存档里找到。
+
+        只用于显示，不改库。早期提炼有时把 text 复述当成原话；
+        对不上的就不该再冒充“当时的原话”。
+        """
+        q = _quote_norm(quote)
+        if len(q) < 2:
+            return False
+        row = self.conn.execute(
+            """SELECT e.transcript, e.session_id FROM trace t
+               JOIN episode e ON e.id=t.episode_id WHERE t.id=?""",
+            (int(trace_id),)).fetchone()
+        if not row:
+            return False
+        if q in _quote_norm(row["transcript"]):
+            return True
+        session_id = row["session_id"] or ""
+        if not session_id:
+            return False
+        raw = self.conn.execute(
+            "SELECT text FROM raw_message WHERE session_id=? ORDER BY id DESC LIMIT 600",
+            (session_id,)).fetchall()
+        return q in "".join(_quote_norm(r["text"]) for r in raw)
 
     def review_candidates(self, after_days: float = 3, asked_days: float = 7,
                           limit: int = 3, session: str = "") -> list[dict]:

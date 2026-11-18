@@ -93,6 +93,32 @@ def api_series():
         s.close()
 
 
+@app.get("/api/resident")
+def api_resident(all: int = 0):
+    """她自己放的常驻区；默认只看还在用的。"""
+    s = db()
+    try:
+        sql = "SELECT * FROM resident_note"
+        if not all:
+            sql += " WHERE status='active'"
+        sql += " ORDER BY id"
+        rows = [dict(r) for r in s.conn.execute(sql).fetchall()]
+        for r in rows:
+            r["scope_label"] = _scope_label(r.get("scope"))
+        active = [r for r in rows if r.get("status") == "active"]
+        return {
+            "items": rows,
+            "n": len(active),
+            "chars": sum(len(r.get("text") or "") for r in active),
+            "max_items": 12,
+            "max_chars": 1200,
+        }
+    except Exception:
+        return {"items": [], "n": 0, "chars": 0, "max_items": 12, "max_chars": 1200}
+    finally:
+        s.close()
+
+
 @app.get("/api/series/{sid}")
 def api_series_one(sid: int):
     s = db()
@@ -196,6 +222,13 @@ def api_trace(tid: int):
         ep = s.conn.execute("SELECT transcript, started_at FROM episode WHERE id=?",
                             (row["episode_id"],)).fetchone() if row["episode_id"] else None
         t["transcript"] = (ep["transcript"] or "")[:1500] if ep else ""
+        if t.get("anchor_quote"):
+            try:
+                if not s.anchor_quote_ok(tid, t["anchor_quote"]):
+                    t["anchor_quote"] = ""
+                    t["anchor_quote_hidden"] = True
+            except Exception:
+                pass
         t["created_at"] = row["created_at"]
         t["state"] = row["state"] if "state" in row.keys() else "open"
         t["kind"] = row["kind"]
@@ -375,6 +408,7 @@ textarea{width:100%;min-height:60px;background:var(--panel);border:1px solid var
       <button id="tab-unres" onclick="loadUnresolved()">未了的事</button>
       <button id="tab-tags" onclick="loadTags()">按主题</button>
       <button id="tab-series" onclick="loadSeries()">系列</button>
+      <button id="tab-resident" onclick="loadResident()">常驻区</button>
       <button id="tab-ov" onclick="loadOverview()">总览</button>
       <button id="tab-st" onclick="loadStats()">统计</button>
       <button id="tab-raw" onclick="loadRaw()">原话</button>
@@ -474,6 +508,24 @@ async function openSeries(sid,el){
       <span class="small">按对话时间排</span></div>
     <div class="box"><h3>里面的记忆</h3>${rows||'<div class="small">空</div>'}</div>
   </div>`;
+}
+async function loadResident(showAll=false){
+  setTab('tab-resident');
+  const d=await j('/api/resident'+(showAll?'?all=1':''));
+  const rows=d.items||[];
+  const head=`<div class="bar" style="padding:8px 12px;align-items:center">
+    <span class="small">常驻区 ${d.n||0}/${d.max_items||12} 条 · ${d.chars||0}/${d.max_chars||1200} 字</span>
+    <button style="margin-left:auto;padding:2px 8px;font-size:12px"
+      onclick="loadResident(${showAll?'false':'true'})">${showAll?'只看在用的':'连已撤的一起看'}</button>
+  </div>`;
+  const html=rows.map(r=>`
+    <div class="item" style="${r.status==='retired'?'opacity:.55':''}">
+      <div><span class="kind">${r.status==='retired'?'已撤':'常驻'}</span>
+        <span class="small">#${r.id} · ${scopeLabelJS(r.scope)} · ${fmtWhen(r.created_at)}</span></div>
+      <div class="txt" style="white-space:pre-wrap">${esc(r.text)}</div>
+    </div>`).join('');
+  document.getElementById('list').innerHTML = head + (html||'<div class="empty">常驻区还是空的</div>');
+  document.getElementById('detail').innerHTML='<div class="empty">她自己放进去的东西，只读</div>';
 }
 function setTab(id){document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));
   document.getElementById(id)?.classList.add('on');}
@@ -627,7 +679,7 @@ if (new URLSearchParams(location.search).get('embed') === '1') {
   document.querySelector('main').style.height = 'calc(100vh - 8px)';
 }
 // 支持 ?id=123 直接打开某一条
-const _q = new URLSearchParams(location.search); if (_q.get('tab') === 'ov') { setTimeout(() => loadOverview(), 200); } if (_q.get('tab') === 'st') { setTimeout(() => loadStats(), 200); } if (_q.get('tab') === 'series') { setTimeout(() => loadSeries(), 200); } const deepId = _q.get('id');
+const _q = new URLSearchParams(location.search); if (_q.get('tab') === 'ov') { setTimeout(() => loadOverview(), 200); } if (_q.get('tab') === 'st') { setTimeout(() => loadStats(), 200); } if (_q.get('tab') === 'series') { setTimeout(() => loadSeries(), 200); } if (_q.get('tab') === 'resident') { setTimeout(() => loadResident(), 200); } const deepId = _q.get('id');
 if (deepId) setTimeout(() => openTrace(parseInt(deepId)), 300);
 </script></body></html>"""
 

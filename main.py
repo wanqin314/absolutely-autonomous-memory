@@ -1165,6 +1165,10 @@ class DafeiyuMemory(Star):
                             "\n\n【忽然想到的事·不一定相关】\n" + _lines + "\n")
                         logger.info(f"[memory] 相关挂起项 {[x['id'] for x in _rel]} "
                                     f"相似度 {[x['sim'] for x in _rel]}")
+        except asyncio.CancelledError:
+            # 群聊插件/防抖会取消在途请求；挂起项是可选材料，取消就跳过
+            logger.info("[memory] 请求已取消，跳过挂起项匹配")
+            return
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[memory] 挂起项匹配出错：{type(e).__name__}: {e}")
 
@@ -1344,7 +1348,11 @@ class DafeiyuMemory(Star):
             if her_quotes.get(int(h["id"])):
                 line += f"\n    ｜原话（她留的）：「{her_quotes[int(h['id'])][:80]}」"
             elif h.get("anchor_quote"):
-                line += f"\n    ｜原话：「{h['anchor_quote'][:80]}」"
+                try:
+                    if store.anchor_quote_ok(int(h["id"]), h["anchor_quote"]):
+                        line += f"\n    ｜原话：「{h['anchor_quote'][:80]}」"
+                except Exception:
+                    line += f"\n    ｜原话：「{h['anchor_quote'][:80]}」"
             if h.get("inference"):
                 c = h.get("inference_certainty")
                 line += f"\n    ｜推断（{c:.1f}）：{h['inference']}" if isinstance(c, (int, float)) else f"\n    ｜推断：{h['inference']}"
@@ -1927,7 +1935,13 @@ class DafeiyuMemory(Star):
             out.append(f"她自己的话：{_words[-1]['text']}")
         if _quotes:
             out.append(f"她留的原话：{_quotes[-1]['text']}")
+        quote_ok = True
         if t.get("anchor_quote"):
+            try:
+                quote_ok = store.anchor_quote_ok(int(memory_id), t["anchor_quote"])
+            except Exception:
+                quote_ok = True
+        if t.get("anchor_quote") and quote_ok:
             out.append(f"当时的原话（提炼时留的）：{t['anchor_quote']}")
         if t.get("felt"):
             out.append(f"当时感觉：{t['felt']}")
@@ -1946,7 +1960,7 @@ class DafeiyuMemory(Star):
             if transcript:
                 out.append("—— 当时那段对话 ——")
                 out.append(transcript[:1200] + ("\n……（后面还有）" if len(transcript) > 1200 else ""))
-            elif t.get("anchor_quote"):
+            elif t.get("anchor_quote") and quote_ok:
                 out.append("（只留下这一句原话，那段对话没有存档。）")
             else:
                 out.append("（这段对话没有留下原文。）")

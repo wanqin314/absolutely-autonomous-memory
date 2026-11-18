@@ -96,7 +96,7 @@ kind 只能是这六种：
   recur 只允许 daily（每周的先不填）。
   **注意：一次性的时间（明天九点、18号早上八点）必须写 due_at，不要写 due_time。**
   例：「18号早上八点提醒我带充电器」→ due_at="2026-11-18T08:00:00+08:00"，due_time=null，recur=null。
-- anchor_quote：对话里最能定位这件事的一句原话（照抄，可截断）
+- anchor_quote：从上面「对话」里**逐字**摘一句，必须能在原文里找到；不能复述 text、不能自己造句；找不到就留空。
 - tags：最多 2 个短标签（人/主题）
 - 最多 5 条；没有值得留的就输出 {{"items":[]}}
 
@@ -747,6 +747,23 @@ def _link_entities(store, trace_id: int, names: list[str]) -> None:
             continue
 
 
+def _norm_quote(text: str) -> str:
+    """原话比对用：去掉空白、标点和包裹引号，只留字。"""
+    s = str(text or "").strip().strip("「」『』“”\"'")
+    return re.sub(r"[\s，。！？、,.!?：:；;…—\-（）()\[\]【】]+", "", s)
+
+
+def _verified_quote(quote: str, transcript: str) -> str:
+    """只保留在本次对话里逐字出现过的原话；对不上就留空，不拿复述充数。"""
+    raw = str(quote or "").strip()
+    q = _norm_quote(raw)
+    if len(q) < 2 or not transcript:
+        return ""
+    if q in _norm_quote(transcript):
+        return raw[:200]
+    return ""
+
+
 def write_items(store, items: list[dict], lines: list[dict], scope: str, session_id: str) -> int:
     """落库：一个 episode + N 条 trace。返回写入条数。"""
     if not items:
@@ -754,8 +771,12 @@ def write_items(store, items: list[dict], lines: list[dict], scope: str, session
     transcript = "\n".join(f"[{m.get('role')}] {m.get('text','')}" for m in lines)
     first_ts = (lines[0].get("created_at") if lines else None) or ""
     last_ts = (lines[-1].get("created_at") if lines else None) or ""
-    # 离上一段很近（默认 10 分钟）就并进去，别把一段聊天切成好几段
+    # 离上一段很近（默认 10 分钟）就并进去，别把一段聊天切成好几段。
+    # 群聊不并：群一直有人说话时，10 分钟规则会把整个下午并成一段，
+    # 所有记忆都指回同一份两小时的 transcript。
     reuse = float(os.environ.get("AAM_REUSE_EPISODE_MIN", "10") or 10)
+    if scope.startswith("group:"):
+        reuse = float(os.environ.get("AAM_GROUP_REUSE_EPISODE_MIN", "0") or 0)
     episode_id = None
     if reuse > 0:
         try:
@@ -780,7 +801,12 @@ def write_items(store, items: list[dict], lines: list[dict], scope: str, session
             transcript=transcript, source="live", source_ref=session_id,
         )
     n = 0
+    dropped_quotes = 0
     for it in items:
+        raw_quote = str(it.get("anchor_quote") or "").strip()
+        it["anchor_quote"] = _verified_quote(raw_quote, transcript)
+        if raw_quote and not it["anchor_quote"]:
+            dropped_quotes += 1
         if is_self_noise(it):
             continue
         when = it.get("event_time") or last_ts
@@ -826,4 +852,6 @@ def write_items(store, items: list[dict], lines: list[dict], scope: str, session
         except Exception:
             pass
         n += 1
+    if dropped_quotes:
+        logger.info(f"[memory] 丢弃 {dropped_quotes} 条对不上原文的原话")
     return n
