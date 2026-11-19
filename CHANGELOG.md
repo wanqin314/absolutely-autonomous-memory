@@ -1,5 +1,12 @@
 # 更新日志
 
+## v0.46.2 — 2026-11-19（空闲触发随机化）
+
+- 自我思考的空闲触发从固定 30 分钟改为 10–60 分钟随机：每次进入新的空闲期抽一次，不会每 5 分钟重抽
+- 新增 `self_think_idle_min_minutes` / `self_think_idle_max_minutes`
+- 等回答超时单独用 `self_think_answer_timeout_minutes`（默认 30），不再跟空闲触发共用
+- `self_think_idle_minutes` 保留为未配置上下限时的兜底
+
 ## v0.46.1 — 2026-11-19（默认关闭思考提问）
 
 - `self_think_ask_enabled` 默认值改为 `false`：新装用户即使打开自我思考，也不会默认收到她的提问

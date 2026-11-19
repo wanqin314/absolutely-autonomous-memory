@@ -1,7 +1,7 @@
-"""她自己的时间：空闲 30 分钟后，连续想 60 分钟，每 5 分钟醒一次。
+"""她自己的时间：空闲 10–60 分钟后，连续想 60 分钟，每 5 分钟醒一次。
 
 不是聊天，不发消息；只把她自己写下的思考存进 self_thought。
-有人直接找她（私聊 / @ / 引用她 / 叫名字）就暂停；再空闲 30 分钟接续。
+有人直接找她（私聊 / @ / 引用她 / 叫名字）就暂停；再空闲 10–60 分钟接续。
 思考结束后 2 小时不再自动触发。
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 import time
 import inspect
@@ -54,6 +55,7 @@ class SelfThinker:
         st = {
             "phase": "idle",
             "last_activity": time.time(),
+            "idle_target_sec": 0.0,
             "session": "",
             "started_at": 0.0,
             "ticks_done": 0,
@@ -114,7 +116,7 @@ class SelfThinker:
                 self._save()
                 return "resumed"
             self.state["cooldown_until"] = 0.0
-            self.state["last_activity"] = now - self._sec("self_think_idle_minutes", 30) * 60 - 1
+            self.state["last_activity"] = now - self._idle_sec() - 1
             await self._begin(now, seed_id=seed_id)
             return "started" if self.state.get("phase") == "thinking" else "no_session"
 
@@ -168,6 +170,7 @@ class SelfThinker:
         if not self.is_directed(event):
             return
         self.state["last_activity"] = time.time()
+        self.state["idle_target_sec"] = self._pick_idle_sec()
         if self.state.get("waiting_answer"):
             try:
                 same_session = str(getattr(event, "unified_msg_origin", "") or "") == str(self.state.get("session") or "")
@@ -218,11 +221,35 @@ class SelfThinker:
         except Exception:
             return float(default)
 
+    def _pick_idle_sec(self) -> float:
+        try:
+            lo = float(self.p._cfg("self_think_idle_min_minutes", 10))
+            hi = float(self.p._cfg("self_think_idle_max_minutes", 60))
+            if hi < lo:
+                lo, hi = hi, lo
+            return random.uniform(max(1.0, lo), max(1.0, hi)) * 60
+        except Exception:
+            return self._sec("self_think_idle_minutes", 30) * 60
+
+    def _idle_sec(self) -> float:
+        try:
+            v = float(self.state.get("idle_target_sec") or 0)
+        except Exception:
+            v = 0.0
+        if v <= 0:
+            v = self._pick_idle_sec()
+            self.state["idle_target_sec"] = v
+            try:
+                self._save()
+            except Exception:
+                pass
+        return v
+
     async def _step(self) -> None:
         async with self._lock:
             now = time.time()
             phase = self.state.get("phase") or "idle"
-            idle_sec = self._sec("self_think_idle_minutes", 30) * 60
+            idle_sec = self._idle_sec()
             cooldown_until = float(self.state.get("cooldown_until") or 0)
             last_activity = float(self.state.get("last_activity") or now)
 
@@ -233,7 +260,8 @@ class SelfThinker:
 
             if phase == "paused":
                 if self.state.get("waiting_answer"):
-                    if now - last_activity >= idle_sec:
+                    answer_sec = self._sec("self_think_answer_timeout_minutes", 30) * 60
+                    if now - last_activity >= answer_sec:
                         self.state["waiting_answer"] = False
                         self.state["phase"] = "thinking"
                         self.state["last_tick_at"] = 0.0
@@ -777,6 +805,7 @@ class SelfThinker:
             "phase": "idle",
             "cooldown_until": now + cooldown,
             "last_activity": now,
+            "idle_target_sec": 0.0,
             "ticks_done": 0,
             "thread": [],
             "materials": [],

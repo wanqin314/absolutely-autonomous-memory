@@ -41,7 +41,22 @@
         "hint": "连续 30 分钟没人直接找她后，自己安静想 60 分钟；不发消息，只写 self_thought。"
     },
     "self_think_idle_minutes": {
-        "description": "自我思考：空闲多少分钟触发",
+        "description": "自我思考：空闲多少分钟触发（旧项，未设上下限时兜底）",
+        "type": "int",
+        "default": 30
+    },
+    "self_think_idle_min_minutes": {
+        "description": "自我思考：空闲触发下限（分钟）",
+        "type": "int",
+        "default": 10
+    },
+    "self_think_idle_max_minutes": {
+        "description": "自我思考：空闲触发上限（分钟）",
+        "type": "int",
+        "default": 60
+    },
+    "self_think_answer_timeout_minutes": {
+        "description": "自我思考：问完等回答超时（分钟）",
         "type": "int",
         "default": 30
     },
