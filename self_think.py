@@ -433,7 +433,7 @@ class SelfThinker:
         if answers:
             answer_text = "\n\n【婉清刚回答你】\n" + "\n".join(f"- {x}" for x in answers[-5:])
             self.state["answers"] = []
-        ask_ok = bool(self.p._cfg("self_think_ask_enabled", True))
+        ask_ok = bool(self.p._cfg("self_think_ask_enabled", False))
         ask_line = ("想对婉清说一句时，可以写一行：问：<一句话>\n" if ask_ok else "")
         prompt = (
             f"【自我时间】\n"
@@ -535,7 +535,7 @@ class SelfThinker:
                    "记住：<一句话>\n"
                    "不留\n"
                    "如果这段让你对某条旧想法有了不同看法，可以写：改写 #编号：新的说法\n")
-        ask_ok = bool(self.p._cfg("self_think_ask_enabled", True))
+        ask_ok = bool(self.p._cfg("self_think_ask_enabled", False))
         ask_tail = ("想问的，可以在收尾之后再另起一行：问：<一句话>\n" if ask_ok else "")
         ask_note = ("整段记录只留在这里；只有“问：”那一句会发给我。"
                     if ask_ok else "整段记录只留在这里，不会发出去。")
@@ -666,7 +666,7 @@ class SelfThinker:
 
     async def _handle_asks(self, session: str, text: str) -> None:
         """她写「问：一句话」：可以主动开口；一次醒来最多 1 条，整段最多 3 条。"""
-        if not bool(self.p._cfg("self_think_ask_enabled", True)):
+        if not bool(self.p._cfg("self_think_ask_enabled", False)):
             return
         asks = re.findall(r"(?m)^\s*问\s*[:：]\s*(.+?)\s*$", text or "")
         if not asks:
