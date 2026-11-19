@@ -71,7 +71,7 @@ W_KEYWORD_EXACT = 0.35   # 短查询/含数字英文时，字面匹配更重要
 BONUS_UNRESOLVED = 0.05   # 只在 base>=0.2 时加，避免约定压过事实
 AVAIL_FLOOR = 0.5          # 再难想，也保留一半权重
 VEC_FLOOR = 0.40           # bge-m3 对无关中文也有 ~0.4 基线，先扣掉再归一
-IMPRESSION_THRESHOLD = 0.35
+IMPRESSION_THRESHOLD = 0.20
 ENTITY_BONUS = 0.0
 CHUNK_MODE = os.environ.get("AAM_CHUNK_MODE", "off")
 CHUNK_W = float(os.environ.get("AAM_CHUNK_W", "0.3") or 0.3)
@@ -223,7 +223,8 @@ def _keyword_scores(store, query: str, limit: int = 40) -> dict[int, float]:
     for tok in (tokens or [q]):
         rows = store.conn.execute(
             """SELECT t.id FROM trace t JOIN trace_version v ON v.id=t.head_version_id
-               WHERE v.text LIKE ? LIMIT ?""", (f"%{tok}%", limit)).fetchall()
+               WHERE v.text LIKE ? OR v.topics LIKE ? LIMIT ?""",
+            (f"%{tok}%", f"%{tok}%", limit)).fetchall()
         for r in rows:
             out[int(r["id"])] = max(out.get(int(r["id"]), 0.0), 0.8 if len(tok) < 3 else 0.6)
     if out:
@@ -291,7 +292,7 @@ def search(store, query: str, top_k: int = 5, kind: str = "",
         if scope:
             _sc = row["scope"] if "scope" in row.keys() else ""
             _sc = _sc or ""
-            if scope == "private" and _sc != "private":
+            if scope == "private" and not (_sc == "private" or _sc.startswith("private:")):
                 continue
             if scope == "group" and not _sc.startswith("group:"):
                 continue
@@ -483,7 +484,7 @@ def impression(store, text: str) -> dict | None:
     top = hits[0]
     if top["score"] < IMPRESSION_THRESHOLD:
         return None
-    relevant = [h for h in hits if h["score"] >= 0.55]
+    relevant = [h for h in hits if h["score"] >= 0.30]
     if not relevant:
         return None
     open_unresolved = any(h["kind"] in ("unresolved", "promise") and h.get("state", "open") == "open"
@@ -529,7 +530,19 @@ def related_open_items(store, text: str, session_id: str = "",
 def impression_line(imp: dict | None) -> str | None:
     if not imp:
         return None
-    if imp["strength"] < 0.35:
+    s = float(imp["strength"])
+    if s < 0.20:
         return None
-    weakest = " · 似有若无" if imp["strength"] < 0.5 else ""
-    return f"[印象 · 熟悉度 {imp['strength']:.2f} · {imp['count']} 条 · {imp['kind']}]{weakest}"
+    weakest = " · 似有若无" if s < 0.5 else ""
+    kind = imp.get("kind") or "话题"
+    if s >= 0.65:
+        if kind == "未了":
+            tail = "这里有件还没结的事对得上，要不要翻翻？"
+        else:
+            tail = "这条和一件旧事对得上，要不要看看？"
+    elif s >= 0.45:
+        tail = "这里似乎有一件相关的事，要不要翻翻？"
+    else:
+        tail = "似乎有点相关，要不要翻翻？不翻也没关系。"
+    return (f"[印象 · 熟悉度 {s:.2f} · {imp['count']} 条 · {kind}]{weakest} "
+            f"{tail}")

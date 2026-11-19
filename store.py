@@ -245,6 +245,52 @@ CREATE TABLE IF NOT EXISTS recall_log (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS recall_query_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT DEFAULT '',
+    query      TEXT DEFAULT '',
+    hits       INTEGER DEFAULT 0,
+    degraded   INTEGER DEFAULT 0,
+    sort       TEXT DEFAULT '',
+    trigger    TEXT DEFAULT '',
+    scope      TEXT DEFAULT '',
+    kind       TEXT DEFAULT '',
+    person     TEXT DEFAULT '',
+    results    TEXT DEFAULT '',
+    since      TEXT DEFAULT '',
+    until      TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS two_stage_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT DEFAULT '',
+    scope       TEXT DEFAULT '',
+    user_text   TEXT DEFAULT '',
+    decision    TEXT DEFAULT '',
+    query       TEXT DEFAULT '',
+    thought     TEXT DEFAULT '',
+    raw         TEXT DEFAULT '',
+    materials   TEXT DEFAULT '',
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS self_thought (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT DEFAULT '',
+    started_at TEXT DEFAULT '',
+    tick_no    INTEGER DEFAULT 0,
+    text       TEXT DEFAULT '',
+    status     TEXT DEFAULT 'thinking',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS self_model (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    text       TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_trace_episode ON trace(episode_id);
 CREATE INDEX IF NOT EXISTS idx_version_trace ON trace_version(trace_id, version_no);
 CREATE INDEX IF NOT EXISTS idx_episode_scope ON episode(scope, started_at);
@@ -307,6 +353,7 @@ CREATE TABLE IF NOT EXISTS raw_message (
 CREATE TABLE IF NOT EXISTS correction (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
+    trace_id   INTEGER DEFAULT 0,
     text       TEXT NOT NULL,
     applied    INTEGER DEFAULT 0,
     created_at TEXT NOT NULL
@@ -314,6 +361,20 @@ CREATE TABLE IF NOT EXISTS correction (
 
 CREATE INDEX IF NOT EXISTS idx_raw_time ON raw_message(created_at);
 CREATE INDEX IF NOT EXISTS idx_raw_session ON raw_message(session_id, created_at);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS raw_message_fts USING fts5(
+    text,
+    session_id UNINDEXED,
+    sender UNINDEXED,
+    role UNINDEXED,
+    created_at UNINDEXED,
+    tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS raw_message_fts_ai AFTER INSERT ON raw_message BEGIN
+    INSERT INTO raw_message_fts(rowid, text, session_id, sender, role, created_at)
+    VALUES (new.id, new.text, new.session_id, new.sender, new.role, new.created_at);
+END;
 
 CREATE TABLE IF NOT EXISTS pending_message (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -389,6 +450,8 @@ class Store:
             self.conn.execute("ALTER TABLE trace ADD COLUMN reminded_at TEXT")
         if "due_time" not in cols:
             self.conn.execute("ALTER TABLE trace ADD COLUMN due_time TEXT")
+        if "due_hint" not in cols:
+            self.conn.execute("ALTER TABLE trace ADD COLUMN due_hint TEXT")
         if "recur" not in cols:
             self.conn.execute("ALTER TABLE trace ADD COLUMN recur TEXT DEFAULT ''")
         if "scope" not in cols:
@@ -427,6 +490,32 @@ class Store:
             self.conn.execute("ALTER TABLE trace_version ADD COLUMN inference TEXT")
         if "inference_certainty" not in vcols:
             self.conn.execute("ALTER TABLE trace_version ADD COLUMN inference_certainty REAL")
+        qcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(recall_query_log)")}
+        if qcols and "results" not in qcols:
+            self.conn.execute("ALTER TABLE recall_query_log ADD COLUMN results TEXT DEFAULT ''")
+        if qcols and "since" not in qcols:
+            self.conn.execute("ALTER TABLE recall_query_log ADD COLUMN since TEXT DEFAULT ''")
+        if qcols and "until" not in qcols:
+            self.conn.execute("ALTER TABLE recall_query_log ADD COLUMN until TEXT DEFAULT ''")
+        if qcols and "trigger" not in qcols:
+            self.conn.execute("ALTER TABLE recall_query_log ADD COLUMN trigger TEXT DEFAULT ''")
+        ccols = {r["name"] for r in self.conn.execute("PRAGMA table_info(correction)")}
+        if ccols and "trace_id" not in ccols:
+            self.conn.execute("ALTER TABLE correction ADD COLUMN trace_id INTEGER DEFAULT 0")
+            for r in self.conn.execute("SELECT id,text FROM correction WHERE COALESCE(trace_id,0)=0").fetchall():
+                m = re.search(r"#(\d+)", str(r["text"] or ""))
+                if m:
+                    self.conn.execute("UPDATE correction SET trace_id=? WHERE id=?",
+                                      (int(m.group(1)), int(r["id"])))
+        # 原话 FTS 初次启用时回填；之后由触发器同步
+        try:
+            self.conn.execute(
+                """INSERT INTO raw_message_fts(rowid, text, session_id, sender, role, created_at)
+                   SELECT r.id, r.text, r.session_id, r.sender, r.role, r.created_at
+                   FROM raw_message r
+                   WHERE r.id NOT IN (SELECT rowid FROM raw_message_fts)""")
+        except Exception:
+            pass
         # 老记录补上衰减起点，否则第一次衰减会从 NULL 算
         self.conn.execute(
             "UPDATE trace SET decayed_at = COALESCE(last_active_at, created_at) WHERE decayed_at IS NULL")
@@ -470,7 +559,7 @@ class Store:
                   episode_id: int | None = None, anchor_quote: str = "",
                   anchor_time: str = "", encoded_state: Any = None,
                   event_time: str = "", due_at: str = "", due_time: str = "",
-                  recur: str = "", topics: Any = None,
+                  due_hint: str = "", recur: str = "", topics: Any = None,
                   certainty: float | None = None, tags: Any = None,
                   felt: str = "", reaction: str = "", inference: str = "",
                   inference_certainty: float | None = None,
@@ -519,6 +608,9 @@ class Store:
         if due_time or recur:
             self.conn.execute("UPDATE trace SET due_time=?, recur=? WHERE id=?",
                               (due_time or None, recur or "", trace_id))
+        if due_hint:
+            self.conn.execute("UPDATE trace SET due_hint=? WHERE id=?",
+                              (due_hint[:32], trace_id))
         self.conn.commit()
         return trace_id
 
@@ -563,7 +655,7 @@ class Store:
                     change_class: str = "minor", certainty: float | None = None,
                     anchor_quote: str = "", anchor_time: str = "",
                     event_time: str = "", due_at: str = "", due_time: str = "",
-                    recur: str = "", topics: Any = None,
+                    due_hint: str = "", recur: str = "", topics: Any = None,
                     felt: str = "", reaction: str = "", inference: str = "",
                     inference_certainty: float | None = None,
                     encoded_state: Any = None) -> int:
@@ -615,11 +707,12 @@ class Store:
                           (self.index_text(text, topics), trace_id))
         # 正文变了，旧向量作废，等 ensure_vectors 重算
         self.conn.execute("DELETE FROM trace_vec WHERE trace_id=?", (trace_id,))
-        if due_at or due_time or recur:
+        if due_at or due_time or recur or due_hint:
             self.conn.execute(
                 "UPDATE trace SET due_at=COALESCE(NULLIF(?,''),due_at), "
-                "due_time=COALESCE(NULLIF(?,''),due_time), recur=COALESCE(NULLIF(?,''),recur) "
-                "WHERE id=?", (due_at, due_time, recur, trace_id))
+                "due_time=COALESCE(NULLIF(?,''),due_time), "
+                "due_hint=COALESCE(NULLIF(?,''),due_hint), recur=COALESCE(NULLIF(?,''),recur) "
+                "WHERE id=?", (due_at, due_time, due_hint, recur, trace_id))
         self.conn.commit()
         return new_id
 
@@ -644,7 +737,7 @@ class Store:
             raise ValueError("state 只能是 open/settled/void")
         self.conn.execute("UPDATE trace SET state=? WHERE id=?", (state, trace_id))
         self.conn.execute(
-            "UPDATE reminder SET resolved=1 WHERE trace_id=? AND delivered_at IS NULL",
+            "UPDATE reminder SET resolved=1 WHERE trace_id=?",
             (int(trace_id),))
         if note:
             self.add_note(trace_id, note, kind="annotation")
@@ -676,6 +769,45 @@ class Store:
         self.conn.commit()
         self._maybe_meta(trace_id)
         return {"trace_id": trace_id, "r_before": round(r_before, 3), "s_after": round(s, 2)}
+
+    def add_two_stage_log(self, session_id: str, scope: str, user_text: str,
+                          decision: str, query: str, thought: str, raw: str,
+                          materials: str = "") -> None:
+        self.conn.execute(
+            """INSERT INTO two_stage_log
+               (session_id, scope, user_text, decision, query, thought, raw, materials, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (session_id or "", scope or "", (user_text or "")[:1000],
+             decision or "", (query or "")[:500], (thought or "")[:1000],
+             (raw or "")[:2000], (materials or "")[:4000], now_iso()))
+        self.conn.commit()
+
+    def recent_two_stage_logs(self, limit: int = 100) -> list[dict]:
+        rows = self.conn.execute(
+            """SELECT id, session_id, scope, user_text, decision, query, thought,
+                      raw, materials, created_at
+               FROM two_stage_log ORDER BY id DESC LIMIT ?""",
+            (max(1, int(limit)),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def log_recall_query(self, session_id: str, query: str, hits: int,
+                         degraded: bool = False, sort: str = "",
+                         scope: str = "", kind: str = "", person: str = "",
+                         since: str = "", until: str = "",
+                         results: list[dict] | None = None,
+                         trigger: str = "") -> None:
+        """记一次检索调用，包括 0 命中；trigger=tool/system。"""
+        self.conn.execute(
+            """INSERT INTO recall_query_log
+               (session_id, query, hits, degraded, sort, trigger, scope, kind, person,
+                results, since, until, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (session_id or "", (query or "")[:500], int(hits), 1 if degraded else 0,
+             sort or "", trigger or "", scope or "", kind or "", person or "",
+             json.dumps(results or [], ensure_ascii=False),
+             since or "", until or "", now_iso()),
+        )
+        self.conn.commit()
 
     META_STEPS = (3, 5, 7, 10, 15, 20, 30, 50)
 
@@ -909,6 +1041,66 @@ class Store:
             (int(trace_id),)).fetchone()
         return (r["transcript"] if r and r["transcript"] else "") or ""
 
+    def episode_companion(self, trace_id: int) -> dict | None:
+        """同段里找一条相反面的材料：事实↔自我。只做材料，不判因果。"""
+        row = self.conn.execute(
+            """SELECT t.kind, t.episode_id FROM trace t WHERE t.id=?""",
+            (int(trace_id),)).fetchone()
+        if not row or not row["episode_id"]:
+            return None
+        current = row["kind"] or ""
+        want = ("self",) if current in ("fact", "observation") else ("fact", "observation")
+        marks = ",".join("?" for _ in want)
+        r = self.conn.execute(
+            f"""SELECT t.id, t.kind, v.text, COALESCE(v.anchor_time, t.created_at) AS at
+                FROM trace t JOIN trace_version v ON v.id=t.head_version_id
+                WHERE t.episode_id=? AND t.id<>? AND t.status='active' AND t.avoided=0
+                  AND t.kind IN ({marks})
+                ORDER BY COALESCE(v.anchor_time, t.created_at)
+                LIMIT 1""",
+            (int(row["episode_id"]), int(trace_id), *want)).fetchone()
+        return dict(r) if r else None
+
+    def temporal_neighbors(self, trace_id: int, limit: int = 5) -> list[dict]:
+        """同一段对话里、时间相近的事实/观察/自我/推测；只做材料，不判关系。"""
+        row = self.conn.execute(
+            """SELECT t.episode_id, COALESCE(v.anchor_time, t.created_at) AS at,
+                      t.created_at
+               FROM trace t JOIN trace_version v ON v.id=t.head_version_id
+               WHERE t.id=?""",
+            (int(trace_id),)).fetchone()
+        if not row or not row["episode_id"]:
+            return []
+        rows = self.conn.execute(
+            """SELECT t.id, t.kind, COALESCE(v.anchor_time, t.created_at) AS at,
+                      v.text
+               FROM trace t JOIN trace_version v ON v.id=t.head_version_id
+               WHERE t.episode_id=? AND t.id<>?
+                 AND t.kind IN ('fact','observation','self','speculation')
+                 AND t.status='active' AND t.avoided=0
+               LIMIT 30""", (int(row["episode_id"]), int(trace_id))).fetchall()
+
+        def _ts(s):
+            try:
+                from datetime import datetime
+                return datetime.fromisoformat(str(s)).timestamp()
+            except Exception:
+                return 0.0
+
+        base = _ts(row["at"] or row["created_at"])
+        out = []
+        for r in rows:
+            t = _ts(r["at"])
+            out.append({
+                "id": int(r["id"]),
+                "kind": r["kind"] or "",
+                "text": str(r["text"] or ""),
+                "at": r["at"] or "",
+                "delta_min": int(abs(t - base) / 60) if base and t else None,
+            })
+        out.sort(key=lambda x: (x["delta_min"] is None, x["delta_min"] or 0))
+        return out[:max(1, int(limit or 5))]
+
     def anchor_quote_ok(self, trace_id: int, quote: str) -> bool:
         """旧数据回看：原话能不能在 transcript 或原话存档里找到。
 
@@ -1010,6 +1202,70 @@ class Store:
         r = self.conn.execute(
             "SELECT COUNT(*) FROM reflection WHERE date(created_at)=date('now','localtime')").fetchone()
         return int(r[0] if r else 0)
+
+    def add_self_thought(self, session_id: str, started_at: str, tick_no: int,
+                         text: str, status: str = "thinking") -> int:
+        cur = self.conn.execute(
+            """INSERT INTO self_thought(session_id, started_at, tick_no, text, status, created_at)
+               VALUES (?,?,?,?,?,?)""",
+            (session_id or "", started_at or "", int(tick_no), text or "",
+             status or "thinking", now_iso()),
+        )
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def self_thoughts_recent(self, limit: int = 12, session_id: str = "") -> list[dict]:
+        if session_id:
+            rows = self.conn.execute(
+                "SELECT * FROM self_thought WHERE session_id=? ORDER BY id DESC LIMIT ?",
+                (session_id, int(limit))).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM self_thought ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
+
+    def self_thoughts_search(self, terms: list[str], limit: int = 5,
+                             session_id: str = "", since: str = "",
+                             until: str = "") -> list[dict]:
+        terms = [t for t in (terms or []) if t]
+        if not terms:
+            return []
+        where = " OR ".join("text LIKE ?" for _ in terms)
+        args: list = [f"%{t}%" for t in terms]
+        sql = f"SELECT * FROM self_thought WHERE ({where})"
+        if session_id:
+            sql += " AND session_id=?"
+            args.append(session_id)
+        if since:
+            sql += " AND date(created_at)>=date(?)"
+            args.append(since)
+        if until:
+            sql += " AND date(created_at)<=date(?)"
+            args.append(until)
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(max(1, int(limit)))
+        rows = self.conn.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def add_self_model(self, text: str) -> int:
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("empty self model")
+        cur = self.conn.execute(
+            "INSERT INTO self_model(text, created_at) VALUES (?,?)",
+            (text[:1200], now_iso()))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def current_self_model(self) -> dict | None:
+        r = self.conn.execute(
+            "SELECT * FROM self_model ORDER BY id DESC LIMIT 1").fetchone()
+        return dict(r) if r else None
+
+    def self_model_history(self, limit: int = 5) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM self_model ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+        return [dict(r) for r in rows]
 
     def reflections_today_for(self, session: str, decision: str = "speak") -> int:
         r = self.conn.execute(
@@ -1375,14 +1631,24 @@ class Store:
         self.notice_add(int(trace_id), "due")
         return True
 
-    def pending_reminders(self, session_id: str, limit: int = 2) -> list[dict]:
+    def pending_reminders(self, session_id: str, limit: int = 2,
+                          repeat_minutes: float = 0) -> list[dict]:
+        """未投递的提醒；repeat_minutes>0 时，已投递但还没处理的老提醒也会再递。"""
+        repeat = max(0.0, float(repeat_minutes or 0))
+        if repeat > 0:
+            delivered = ("(r.delivered_at IS NULL OR "
+                         "julianday(r.delivered_at) <= julianday('now') - (?/1440.0))")
+            args: list = [repeat, session_id, int(limit)]
+        else:
+            delivered = "r.delivered_at IS NULL"
+            args = [session_id, int(limit)]
         rows = self.conn.execute(
-            """SELECT r.id, r.trace_id, r.text FROM reminder r
-               JOIN trace t ON t.id=r.trace_id
-               WHERE r.delivered_at IS NULL AND r.resolved=0
-                 AND t.status='active' AND COALESCE(t.state,'open') IN ('open','missed')
-                 AND (r.session_id=? OR r.session_id='' OR r.session_id IS NULL)
-               ORDER BY r.id LIMIT ?""", (session_id, int(limit))).fetchall()
+            f"""SELECT r.id, r.trace_id, r.text, r.delivered_at FROM reminder r
+                JOIN trace t ON t.id=r.trace_id
+                WHERE {delivered} AND r.resolved=0
+                AND t.status='active' AND COALESCE(t.state,'open') IN ('open','missed')
+                AND (r.session_id=? OR r.session_id='' OR r.session_id IS NULL)
+                ORDER BY r.id LIMIT ?""", args).fetchall()
         return [dict(r) for r in rows]
 
     def pending_recurring_reminders(self, limit: int = 2) -> list[dict]:
@@ -1456,7 +1722,7 @@ class Store:
                 if base.startswith(_p):
                     base = base[len(_p):]
             base = base.replace("（说的时间到了）", "").strip("。 ")
-            note = f"这件事过了时候：「{base[:60]}」——还挂着，你心里有数"
+            note = f"这件事过了时候：「{base[:60]}」"
             self.conn.execute(
                 "UPDATE reminder SET text=?, delivered_at=NULL, created_at=? WHERE id=?",
                 (note[:300], now_iso(), int(r["id"])))
@@ -1644,6 +1910,95 @@ class Store:
             (f"%{q}%", int(limit))).fetchall()
         return [dict(r) for r in rows]
 
+    def recent_traces(self, kind: str = "", limit: int = 8, since: str = "",
+                      until: str = "", scope: str = "", person: str = "") -> list[dict]:
+        """无 query 时按时间翻：她只想'看看最近的'，不是搜关键词。"""
+        conds = ["t.status='active'", "t.avoided=0"]
+        args: list = []
+        if kind:
+            conds.append("t.kind=?")
+            args.append(kind)
+        if since:
+            conds.append("date(COALESCE(v.anchor_time,t.created_at))>=date(?)")
+            args.append(since)
+        if until:
+            conds.append("date(COALESCE(v.anchor_time,t.created_at))<=date(?)")
+            args.append(until)
+        if scope == "private":
+            conds.append("t.scope='private'")
+        elif scope == "group":
+            conds.append("t.scope LIKE 'group:%'")
+        elif scope.startswith("group:"):
+            conds.append("t.scope=?")
+            args.append(scope)
+        if person:
+            conds.append("(v.text LIKE ? OR v.topics LIKE ?)")
+            args.extend([f"%{person}%", f"%{person}%"])
+        args.append(max(1, int(limit)))
+        rows = self.conn.execute(
+            f"""SELECT t.id, t.kind, t.state, v.text,
+                       COALESCE(v.anchor_time, t.created_at) AS anchor_time,
+                       t.scope
+                FROM trace t JOIN trace_version v ON v.id=t.head_version_id
+                WHERE {' AND '.join(conds)}
+                ORDER BY anchor_time DESC LIMIT ?""", args).fetchall()
+        return [dict(r) for r in rows]
+
+    def raw_fts_search(self, match_query: str, limit: int = 5, session_id: str = "",
+                       since: str = "", until: str = "") -> list[dict]:
+        """搜原话；只做字面命中，不参与 trace 排序。"""
+        match_query = (match_query or "").strip()
+        if not match_query:
+            return []
+        sql = """SELECT r.id, r.session_id, r.role, r.text, r.sender, r.created_at
+                 FROM raw_message_fts f JOIN raw_message r ON r.id=f.rowid
+                 WHERE raw_message_fts MATCH ?"""
+        args: list = [match_query]
+        if session_id:
+            sql += " AND r.session_id=?"
+            args.append(session_id)
+        if since:
+            sql += " AND date(r.created_at)>=date(?)"
+            args.append(since)
+        if until:
+            sql += " AND date(r.created_at)<=date(?)"
+            args.append(until)
+        sql += " ORDER BY rank LIMIT ?"
+        args.append(max(1, int(limit)))
+        try:
+            rows = self.conn.execute(sql, args).fetchall()
+        except Exception:
+            rows = []
+        if rows:
+            return [dict(r) for r in rows]
+
+        # trigram 对 2 个汉字（如“汉堡”）不建索引，退回字面 LIKE。
+        import re as _re
+        terms = _re.findall(r'"([^"]+)"', match_query) or [match_query.strip('"')]
+        terms = [t for t in terms if t]
+        if not terms:
+            return []
+        where = " OR ".join("text LIKE ?" for _ in terms)
+        like_args: list = [f"%{t}%" for t in terms]
+        lsql = f"""SELECT id, session_id, role, text, sender, created_at
+                   FROM raw_message WHERE ({where})"""
+        if session_id:
+            lsql += " AND session_id=?"
+            like_args.append(session_id)
+        if since:
+            lsql += " AND date(created_at)>=date(?)"
+            like_args.append(since)
+        if until:
+            lsql += " AND date(created_at)<=date(?)"
+            like_args.append(until)
+        lsql += " ORDER BY created_at DESC LIMIT ?"
+        like_args.append(max(1, int(limit)))
+        try:
+            rows = self.conn.execute(lsql, like_args).fetchall()
+        except Exception:
+            return []
+        return [dict(r) for r in rows]
+
     def reindex_trace(self, trace_id: int) -> None:
         """按当前 head 版本的正文+主题，重建这条的 FTS。"""
         row = self.conn.execute("SELECT head_version_id FROM trace WHERE id=?", (trace_id,)).fetchone()
@@ -1670,24 +2025,28 @@ class Store:
 
     # ---------- 更正（上下文覆盖） ----------
 
-    def add_correction(self, session_id: str, text: str) -> None:
+    def add_correction(self, session_id: str, text: str, trace_id: int = 0) -> None:
         self.conn.execute(
-            "INSERT INTO correction(session_id, text, created_at) VALUES (?,?,?)",
-            (session_id, text, now_iso()))
+            "INSERT INTO correction(session_id, trace_id, text, created_at) VALUES (?,?,?,?)",
+            (session_id, int(trace_id or 0), text, now_iso()))
         self.conn.commit()
 
     def recent_corrections(self, session_id: str, hours: int = 24, limit: int = 8) -> list[str]:
-        """取最近 N 小时的更正；不标记已用，所以会持续在场直到过期。
-
-        hours <= 0 时退化成「只用一次」的旧行为。
-        """
+        """取最近 N 小时、且旧事还没了结的更正；已 settle/void 的不再反复出现。"""
         if int(hours) <= 0:
             return self.take_corrections(session_id)
         rows = self.conn.execute(
-            """SELECT text FROM correction
-               WHERE session_id=?
-                 AND julianday(created_at) >= julianday('now') - (? / 24.0)
-               ORDER BY id DESC LIMIT ?""",
+            """SELECT c.text FROM correction c
+               LEFT JOIN trace t ON t.id=c.trace_id
+               WHERE c.session_id=?
+                 AND julianday(c.created_at) >= julianday('now') - (? / 24.0)
+                 AND (
+                      c.trace_id=0 OR (
+                          t.status='active'
+                          AND COALESCE(t.state,'open') IN ('open','missed')
+                      )
+                 )
+               ORDER BY c.id DESC LIMIT ?""",
             (session_id, float(hours), int(limit))).fetchall()
         return [r["text"] for r in reversed(rows)]
 

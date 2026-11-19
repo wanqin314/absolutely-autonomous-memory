@@ -28,6 +28,139 @@
     "default": true,
     "hint": "只递「熟悉度/条数/类别」，不含内容、不带动词。"
   },
+  "impression_cooldown_sec": {
+    "description": "印象提醒冷却秒数",
+    "type": "int",
+    "default": 180,
+    "hint": "同一会话、同一句印象在冷却期内不重复；0 = 不冷却"
+  },
+  "self_think_enabled": {
+    "description": "开启自我思考",
+    "type": "bool",
+    "default": false,
+    "hint": "连续 30 分钟没人直接找她后，自己安静想 60 分钟；不发消息，只写 self_thought。"
+  },
+  "self_think_idle_minutes": {
+    "description": "自我思考：空闲多少分钟触发",
+    "type": "int",
+    "default": 30
+  },
+  "self_think_session_minutes": {
+    "description": "自我思考：累计想多少分钟",
+    "type": "int",
+    "default": 60,
+    "hint": "被打断的时间不算，恢复后继续凑满。"
+  },
+  "self_think_tick_seconds": {
+    "description": "自我思考：每轮间隔秒数",
+    "type": "int",
+    "default": 300
+  },
+  "self_think_cooldown_minutes": {
+    "description": "自我思考：结束后冷却分钟",
+    "type": "int",
+    "default": 120
+  },
+  "self_think_provider_id": {
+    "description": "自我思考用哪个模型",
+    "type": "string",
+    "default": "",
+    "hint": "留空 = 当前私聊所用模型。"
+  },
+  "self_think_session": {
+    "description": "自我思考用哪个会话",
+    "type": "string",
+    "default": "",
+    "hint": "留空 = 最近一个私聊会话。"
+  },
+  "self_think_names": {
+    "description": "哪些叫法算直接找她",
+    "type": "string",
+    "default": "婉凝,大肥鱼,小鲸鱼"
+  },
+  "self_think_system_prompt": {
+    "description": "自我思考的系统提示",
+    "type": "string",
+    "default": "你是婉凝。这是你自己的时间，不是聊天。用第一人称，短句。不要解释格式，不要写给用户看的话。可以接着上次想，可以否定上次，可以只写一句；写“停”就结束。"
+  },
+  "self_think_memory_enabled": {
+    "description": "允许自我思考记进长期记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "只有她明确写“记住：……”的那一句才写进 trace；一次最多两条。"
+  },
+  "self_thought_recall": {
+    "description": "检索时带出未留的思考过程",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭：只有她写“记住：”留下的 self 才算记忆，思考过程只在面板单独看。"
+  },
+  "self_think_ask_enabled": {
+    "description": "思考中可以问婉清",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后她不能在思考中写“问：”发消息；查记忆和收尾选择不受影响。"
+  },
+  "recall_two_stage_enabled": {
+    "description": "回复前先让她在心里过一遍",
+    "type": "bool",
+    "default": false,
+    "hint": "两段式：先判断要不要翻旧记忆，再把想法/材料追加到正式回复末尾；只在线索消息触发。"
+  },
+  "recall_two_stage_cues_only": {
+    "description": "两段式只在线索消息触发",
+    "type": "bool",
+    "default": true,
+    "hint": "上次/之前/记得/约好/人物/明确时间等才触发；普通闲聊不触发。"
+  },
+  "recall_two_stage_private_only": {
+    "description": "两段式只在私聊触发",
+    "type": "bool",
+    "default": true,
+    "hint": "群聊先不动，避免延迟和刷屏。"
+  },
+  "recall_two_stage_group_enabled": {
+    "description": "群聊两段式（含回不回判断）",
+    "type": "bool",
+    "default": false,
+    "hint": "只处理被@/引用的群消息：第一段先判断回不回，不回就停；回才进主回复。"
+  },
+  "recall_two_stage_group_directed_only": {
+    "description": "群聊两段式只处理@/引用",
+    "type": "bool",
+    "default": true,
+    "hint": "关掉后概率筛选放行的普通群消息也会先判断回不回。"
+  },
+  "recall_two_stage_timeout_sec": {
+    "description": "两段式预想超时",
+    "type": "int",
+    "default": 12,
+    "hint": "第一段超过这个秒数就跳过，不影响正常回复。"
+  },
+  "recall_two_stage_cooldown_sec": {
+    "description": "两段式冷却",
+    "type": "int",
+    "default": 20,
+    "hint": "同一会话两次预想至少隔多少秒，避免连发消息时重复调用。"
+  },
+  "recall_min_score": {
+    "description": "检索最低分",
+    "type": "float",
+    "default": 0.3,
+    "hint": "低于这个分数不返回；0.30 是原来的底线。"
+  },
+  "recall_time_min_score": {
+    "description": "带时间条件时的最低分",
+    "type": "float",
+    "default": 0.45,
+    "hint": "query 里有昨晚/昨天/今天等时间词时，用更高的底线，避免弱结果凑数。"
+  },
+  "reminder_repeat_minutes": {
+    "description": "到点提醒重复间隔",
+    "type": "int",
+    "default": 30,
+    "hint": "提醒投递后还没处理，隔多少分钟再递一次；0 = 不重复。"
+  },
   "vectors_enabled": {
     "description": "启动后补齐向量",
     "type": "bool",
@@ -241,7 +374,7 @@
   "group_send_allow": {
     "description": "允许主动发话的群号，逗号分隔；空=全部",
     "type": "string",
-    "default": ""
+    "default": "1130276670"
   },
   "group_send_max_per_day": {
     "description": "每个群每天最多主动几条",

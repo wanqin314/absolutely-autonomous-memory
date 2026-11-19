@@ -13,13 +13,15 @@ import asyncio
 import time
 import os
 import random
+import re
 
 from astrbot import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.agent.message import TextPart
 from astrbot.core.config.astrbot_config import AstrBotConfig
 
-from . import archivist, noticer, resident, retriever
+from . import archivist, noticer, resident, retriever, self_think
 from .store import Store, days_between, now_iso
 
 HELP = (
@@ -217,6 +219,139 @@ def _date_bound(value: str):
         return None
 
 
+_TWO_STAGE_CUES = re.compile(
+    r"上次|之前|以前|那天|昨晚|昨天|今夜|记得|还记得|约好|答应|还没|"
+    r"后来|那次|我们说过|你忘|想想|回忆|那时候|当时")
+
+_RELATED_WORDS = {
+    "晚饭": ["晚餐", "晚上吃", "吃饭", "吃"],
+    "晚餐": ["晚饭", "晚上吃", "吃饭", "吃"],
+    "午饭": ["午餐", "中午吃", "吃饭", "吃"],
+    "早餐": ["早饭", "早上吃", "吃饭", "吃"],
+    "早饭": ["早餐", "早上吃", "吃饭", "吃"],
+    "夜宵": ["宵夜", "晚上吃", "吃"],
+    "跑步": ["晨跑", "夜跑", "运动", "跑"],
+    "运动": ["跑步", "锻炼", "跑"],
+    "难过": ["伤心", "低落", "想哭", "不开心"],
+    "生气": ["不高兴", "恼火", "气"],
+}
+_NEGATION_MARKS = ("没", "不", "未", "别", "无")
+
+
+def _related_terms(query: str) -> list[str]:
+    """同义词/类别词；出现否定词就完全不扩，避免把“没吃”扩成“吃”。"""
+    q = (query or "").strip()
+    if not q or any(x in q for x in _NEGATION_MARKS):
+        return []
+    out: list[str] = []
+    for k, vals in _RELATED_WORDS.items():
+        if k in q:
+            for v in vals:
+                if v not in out and v not in q:
+                    out.append(v)
+    return out[:6]
+
+
+def _meal_fallback_needed(query: str) -> bool:
+    q = (query or "")
+    return any(x in q for x in ("晚饭", "午餐", "午饭", "早饭", "早餐",
+                                 "夜宵", "吃了什么", "吃什么", "饭"))
+
+
+def _find_person_impression(base_dir: str, name: str = "", qq: str = "") -> dict | None:
+    """只读 nest 的人物印象 JSON；匹配 name 或 qq_id。"""
+    import glob
+    import json as _json
+    from urllib.parse import unquote
+
+    path = os.path.join(base_dir, "nest_diary", "modules", "impressions", "people")
+    if not os.path.isdir(path):
+        return None
+    name = (name or "").strip()
+    qq = str(qq or "").strip()
+    for fp in glob.glob(os.path.join(path, "*.json")):
+        try:
+            with open(fp, encoding="utf-8-sig") as f:
+                d = _json.load(f)
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        if qq and str(d.get("qq_id") or "") == qq:
+            return d
+        if name and (str(d.get("name") or "") == name or unquote(os.path.basename(fp)) == name + ".json"):
+            return d
+    return None
+
+
+def _raw_match_query(query: str) -> str:
+    """把 query 变成原话 FTS 的 OR 词；去掉时间词，避免整库命中。"""
+    import re as _re
+
+    q = (query or "").strip()
+    if not q:
+        return ""
+    stop = {"昨晚", "昨天", "今天", "今日", "前天", "上周", "最近", "什么",
+            "的", "了", "吗", "呢", "啊", "我", "你", "她", "他"}
+    words = [w.strip("，。！？、,.!?;；:：") for w in _re.split(r"\s+", q)]
+    words = [w for w in words if len(w) >= 2 and w not in stop]
+    if not words:
+        words = [q] if len(q) >= 3 else []
+    return " OR ".join('"' + w.replace('"', '""') + '"' for w in words[:6])
+
+
+def _self_terms(query: str) -> list[str]:
+    import re as _re
+    stop = {"昨晚", "昨天", "今天", "今日", "前天", "上周", "最近", "什么",
+            "的", "了", "吗", "呢", "啊", "我", "你", "她", "他", "自己"}
+    words = [w.strip("，。！？、,.!?;；:：") for w in _re.split(r"\s+", (query or "").strip())]
+    out = [w for w in words if len(w) >= 2 and w not in stop][:6]
+    # 中文常常没有空格：补最后几个二字词，别拿整句去 LIKE。
+    if len(out) == 1 and len(out[0]) > 4:
+        q = out[0]
+        grams = [q[i:i + 2] for i in range(len(q) - 1)]
+        grams = [g for g in grams if len(g) == 2 and g not in stop]
+        out = [q] + grams[-4:]
+    return out[:6]
+
+
+def _auto_time_bounds(query: str, since: str, until: str) -> tuple[str, str]:
+    """query 里写了昨晚/昨天/今天/前天/上周/最近N天，就自动补时间窗。
+
+    显式传了 since/until 时不动；这是给模型漏传参数的兜底。
+    """
+    import re as _re
+    from datetime import date as _date, timedelta as _td
+
+    if since or until:
+        return since, until
+    q = (query or "").strip()
+    if not q:
+        return since, until
+    today = _date.today()
+
+    if _re.search(r"昨晚|昨天晚上|昨夜", q):
+        d = (today - _td(days=1)).isoformat()
+        return d, d
+    if _re.search(r"昨天|昨日", q):
+        d = (today - _td(days=1)).isoformat()
+        return d, d
+    if _re.search(r"今天|今日", q):
+        d = today.isoformat()
+        return d, d
+    if _re.search(r"前天", q):
+        d = (today - _td(days=2)).isoformat()
+        return d, d
+    if _re.search(r"上周|上个星期|上星期", q):
+        monday = today - _td(days=today.weekday() + 7)
+        return monday.isoformat(), (monday + _td(days=6)).isoformat()
+    m = _re.search(r"最近\s*(\d+)\s*天", q)
+    if m:
+        n = max(1, int(m.group(1)))
+        return (today - _td(days=n - 1)).isoformat(), today.isoformat()
+    return since, until
+
+
 @register("astrbot_plugin_absolutely_autonomous_memory", "婉清",
          "绝对自主记忆：原文只追加、痕迹带版本链、她自己翻、事实能了结约定", "v0.43.0")
 
@@ -239,8 +374,9 @@ class DafeiyuMemory(Star):
         self._topics_task: asyncio.Task | None = None
         self._due_task: asyncio.Task | None = None
         self._topics_done: str = ""
-        self._last_imp: dict[str, tuple[float, str]] = {}
+        self._last_imp: dict[str, tuple[float, float, str]] = {}
         self._last_recall: dict[str, dict] = {}
+        self._self_thinker = self_think.SelfThinker(self)
 
     # ---------- 基础 ----------
 
@@ -308,8 +444,25 @@ class DafeiyuMemory(Star):
         except Exception:
             pass
 
+    async def initialize(self):
+        """插件加载完成：建表，按配置启动自我思考。"""
+        try:
+            self._db()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[memory] 初始化数据库失败：{type(e).__name__}: {e}")
+        if bool(self._cfg("self_think_enabled", False)):
+            self._self_thinker.start()
+
     async def terminate(self):
         # 重载时把后台循环停掉，否则旧实例的循环会一直跑（重复走神/重复提醒）
+        try:
+            if getattr(self, "_self_thinker", None):
+                _t = getattr(self._self_thinker, "_task", None)
+                if _t is not None:
+                    _t.cancel()
+                self._self_thinker = None
+        except Exception:
+            pass
         for _name in ("_wander_task", "_due_task", "_sweep_task", "_decay_task",
                       "_topics_task", "_vec_task"):
             _t = getattr(self, _name, None)
@@ -333,6 +486,10 @@ class DafeiyuMemory(Star):
         if not self._enabled:
             return
         try:
+            _u = getattr(response, "usage", None)
+            if _u is not None:
+                logger.info(f"[memory] 主回复 usage：cached={getattr(_u, 'input_cached', 0)} "
+                            f"other={getattr(_u, 'input_other', 0)} out={getattr(_u, 'output', 0)}")
             store = self._db()
             session = event.unified_msg_origin
             scope = self._scope(event)
@@ -687,7 +844,7 @@ class DafeiyuMemory(Star):
                 pid = str(self._cfg("wander_provider_id", "") or "")
                 if not pid:
                     try:
-                        pid = self.context.get_current_chat_provider_id(session) or ""
+                        pid = await self.context.get_current_chat_provider_id(session) or ""
                     except Exception:
                         pid = ""
                 provider = self.context.get_provider_by_id(pid) if pid else None
@@ -999,6 +1156,24 @@ class DafeiyuMemory(Star):
         finally:
             st.close()
 
+    def _recent_in_thread(self, kind: str, limit: int, since: str, until: str,
+                          scope: str, person: str):
+        st = Store(self.db_path)
+        try:
+            return st.recent_traces(kind, limit, since, until, scope, person)
+        finally:
+            st.close()
+
+    def _self_thoughts_in_thread(self, terms: list[str], limit: int, session: str,
+                                 since: str, until: str, recent: bool = False):
+        st = Store(self.db_path)
+        try:
+            if recent and not terms:
+                return st.self_thoughts_recent(limit, session)
+            return st.self_thoughts_search(terms, limit, session, since, until)
+        finally:
+            st.close()
+
     def _impression_in_thread(self, text: str):
         st = Store(self.db_path)
         try:
@@ -1027,26 +1202,31 @@ class DafeiyuMemory(Star):
     def _resident_block(self, event) -> str:
         return resident.render(self._db().resident_active(self._resident_scope_keys(event)))
 
+    def _tail_has(self, req, marker: str) -> bool:
+        for p in (getattr(req, "extra_user_content_parts", None) or []):
+            text = p.get("text", "") if isinstance(p, dict) else getattr(p, "text", "")
+            if marker in str(text or ""):
+                return True
+        return False
+
+    def _append_tail(self, req, text: str) -> None:
+        if not text:
+            return
+        parts = list(getattr(req, "extra_user_content_parts", None) or [])
+        if any(str((p.get("text", "") if isinstance(p, dict) else getattr(p, "text", "")) or "") == text
+               for p in parts):
+            return
+        parts.append(TextPart(text=text))
+        req.extra_user_content_parts = parts
+
     def _push_resident(self, req, event) -> int:
         block = self._resident_block(event)
         if not block:
             return 0
-        parts = list(getattr(req, "extra_user_content_parts", []) or [])
-        if any("【你自己放在常驻区的】" in (getattr(p, "text", "") or "") for p in parts):
+        if self._tail_has(req, "【你自己放在常驻区的】"):
             return 0
-        base = getattr(req, "system_prompt", "") or ""
-        if "【你自己放在常驻区的】" in base:
-            return 0
-        try:
-            from astrbot.core.agent.message import TextPart
-
-            part = TextPart(text=block)
-            if hasattr(part, "mark_as_temp"):
-                part.mark_as_temp()
-            req.extra_user_content_parts = parts
-            req.extra_user_content_parts.append(part)
-        except Exception:  # noqa: BLE001
-            req.system_prompt = (base + "\n\n" + block).strip()
+        # 动态材料放尾部：system/历史前缀保持不变，缓存才吃得到。
+        self._append_tail(req, "\n\n" + block)
         return len(block)
 
     # ---------- 她自己分的系列 ----------
@@ -1097,6 +1277,17 @@ class DafeiyuMemory(Star):
     @filter.on_llm_request()
     async def on_request(self, event: AstrMessageEvent, req):
         """只递「印象」：强度、数量、类别，不含内容、不带动词。"""
+        try:
+            answered = self._self_thinker.touch(event)
+        except Exception:
+            answered = False
+        if answered:
+            try:
+                event.stop_event()
+            except Exception:
+                pass
+            logger.info("[memory] 这是自我思考在等回答：先不回复，留给下一次思考")
+            return
         if self._vec_task is None and bool(self._cfg("vectors_enabled", True)):
             self._vec_task = asyncio.create_task(self._warm_vectors())
         if self._decay_task is None and bool(self._cfg("decay_enabled", True)):
@@ -1135,10 +1326,10 @@ class DafeiyuMemory(Star):
             fixes = self._db().recent_corrections(
                 event.unified_msg_origin, hours=int(self._cfg("correction_hours", 24)), limit=8)
             if fixes:
-                base = getattr(req, "system_prompt", "") or ""
-                if "【更正" not in base:
-                    req.system_prompt = (base + "\n\n【后来才知道的事】\n"
-                                         + "\n".join("- " + f for f in fixes) + "\n")
+                if not self._tail_has(req, "【后来才知道的事】"):
+                    block = ("\n\n【后来才知道的事】\n"
+                             + "\n".join("- " + f for f in fixes) + "\n")
+                    self._append_tail(req, block)
                     logger.info(f"[memory] 注入更正 {len(fixes)} 条")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[memory] 注入更正出错：{type(e).__name__}: {e}")
@@ -1156,13 +1347,12 @@ class DafeiyuMemory(Star):
                 _rel = await asyncio.to_thread(
                     self._related_in_thread, _text, event.unified_msg_origin)
                 if _rel:
-                    _base = getattr(req, "system_prompt", "") or ""
-                    if "【忽然想到" not in _base:
+                    if not self._tail_has(req, "【忽然想到的事·不一定相关】"):
                         _lines = "\n".join(
                             f"「{x['text'][:80]}」——这条还挂着，你自己看要不要提。"
                             for x in _rel[:3])
-                        req.system_prompt = _base + (
-                            "\n\n【忽然想到的事·不一定相关】\n" + _lines + "\n")
+                        self._append_tail(
+                            req, "\n\n【忽然想到的事·不一定相关】\n" + _lines + "\n")
                         logger.info(f"[memory] 相关挂起项 {[x['id'] for x in _rel]} "
                                     f"相似度 {[x['sim'] for x in _rel]}")
         except asyncio.CancelledError:
@@ -1175,12 +1365,19 @@ class DafeiyuMemory(Star):
         # 到点的约定：只递一次
         try:
             st_r = self._db()
-            rems = st_r.pending_reminders(event.unified_msg_origin, limit=3)
+            try:
+                _repeat = float(self._cfg("reminder_repeat_minutes", 30) or 0)
+            except (TypeError, ValueError):
+                _repeat = 30.0
+            rems = st_r.pending_reminders(event.unified_msg_origin, limit=3,
+                                          repeat_minutes=_repeat)
             if rems:
-                base = getattr(req, "system_prompt", "") or ""
-                if "【心里记着" not in base:
+                if not self._tail_has(req, "【心里记着的事】"):
                     lines = "\n".join(f"- {r['text']}" for r in rems)
-                    req.system_prompt = base + f"\n\n【心里记着的事·不用主动说】\n{lines}\n"
+                    self._append_tail(
+                        req,
+                        "\n\n【心里记着的事】\n" + lines +
+                        "\n（要不要说、什么时候说，你自己看。）\n")
                     st_r.mark_reminder_delivered([int(r["id"]) for r in rems])
                     logger.info(f"[memory] 注入到点约定 {len(rems)} 条")
         except Exception as e:  # noqa: BLE001
@@ -1197,9 +1394,9 @@ class DafeiyuMemory(Star):
                 if cands:
                     c = cands[0]
                     st_v.mark_review_asked(int(c["id"]))
-                    base = getattr(req, "system_prompt", "") or ""
-                    if "【还没结的事" not in base:
-                        req.system_prompt = base + (
+                    if not self._tail_has(req, "【还没结的事·三天没动静】"):
+                        self._append_tail(
+                            req,
                             "\n\n【还没结的事·三天没动静】\n"
                             f"#{c['id']}「{c['text'][:80]}」"
                             "——还算数吗？算就继续，不算就用 settle_memory 了结。\n")
@@ -1207,6 +1404,9 @@ class DafeiyuMemory(Star):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[memory] 待确认注入出错：{type(e).__name__}: {e}")
 
+    @filter.on_llm_request(priority=-1000)
+    async def on_request_impression(self, event: AstrMessageEvent, req):
+        """印象放在 system 最后，离当前消息最近。"""
         if not bool(self._cfg("impression_enabled", True)):
             return
         try:
@@ -1219,18 +1419,237 @@ class DafeiyuMemory(Star):
                 self._last_imp.pop(event.unified_msg_origin, None)
                 return
             prev = self._last_imp.get(event.unified_msg_origin)
-            if prev and prev[1] == line and abs(prev[0] - float(imp["strength"])) < 0.1:
-                return  # 和上一轮几乎一样，不再打扰
-            self._last_imp[event.unified_msg_origin] = (float(imp["strength"]), line)
-            base = getattr(req, "system_prompt", "") or ""
-            if "【印象】" in base:
+            now = time.monotonic()
+            try:
+                cooldown = float(self._cfg("impression_cooldown_sec", 180))
+            except (TypeError, ValueError):
+                cooldown = 180.0
+            if prev and cooldown > 0:
+                _ts, prev_strength, prev_line = prev
+                if (now - _ts < cooldown
+                        and prev_line == line
+                        and abs(prev_strength - float(imp["strength"])) < 0.1):
+                    return  # 冷却期内同一句不重复提醒
+            self._last_imp[event.unified_msg_origin] = (
+                now, float(imp["strength"]), line)
+            if self._tail_has(req, "【印象】"):
                 return
-            req.system_prompt = base + "\n\n【印象】\n" + line + "\n"
-            logger.info(f"[memory] 印象：{line}")
+            self._append_tail(req, "\n\n【印象】\n" + line + "\n")
+            logger.info(f"[memory] 印象（尾部）：{line}")
             if self._vec_task is None:
                 self._vec_task = asyncio.create_task(self._warm_vectors())
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[memory] 印象出错：{type(e).__name__}: {e}")
+
+    @filter.on_llm_request(priority=-2000)
+    async def on_request_two_stage(self, event: AstrMessageEvent, req):
+        """正式回复前先让她在心里过一遍；只把材料/想法追加在末尾，保住前缀缓存。"""
+        try:
+            text = (event.message_str or "").strip()
+            if not self._two_stage_want(event, text):
+                return
+            prov = await self._two_stage_provider(event)
+            if prov is None:
+                return
+            try:
+                is_group = not event.is_private_chat()
+            except Exception:
+                is_group = False
+            if is_group:
+                instr = (
+                    "（这一步不用直接发出去，只先在心里过一遍。）\n"
+                    "先判断这句要不要接：\n"
+                    "不要接，就写一行：判断：不回\n"
+                    "要接，就写一行：判断：回\n"
+                    "要翻旧记忆，就写一行：查：<关键词>\n"
+                    "如果心里先有一句判断，写：想：<一句话>"
+                )
+            else:
+                instr = (
+                    "（这一步不用回复婉清，只先在心里过一遍。）\n"
+                    "看上面这句：它是在提旧事、旧约定、某个人，还是某段时间？\n"
+                    "要翻旧记忆，就写一行：查：<关键词>\n"
+                    "不用翻，就写：不用\n"
+                    "如果心里先有一句判断，写：想：<一句话>"
+                )
+            try:
+                resp = await asyncio.wait_for(
+                    prov.text_chat(
+                        prompt=getattr(req, "prompt", None) or text,
+                        contexts=getattr(req, "contexts", None) or [],
+                        system_prompt=getattr(req, "system_prompt", "") or "",
+                        extra_user_content_parts=[TextPart(text=instr)],
+                        persist=False),
+                    timeout=float(self._cfg("recall_two_stage_timeout_sec", 12) or 12))
+            except Exception as e:  # noqa: BLE001
+                logger.info(f"[memory] 两段式预想跳过：{type(e).__name__}: {e}")
+                return
+            raw = (getattr(resp, "completion_text", "") or "").strip()
+            _u = getattr(resp, "usage", None)
+            if _u is not None:
+                logger.info(f"[memory] 两段式第一段 usage：cached={getattr(_u, 'input_cached', 0)} "
+                            f"other={getattr(_u, 'input_other', 0)} out={getattr(_u, 'output', 0)}")
+            qm = re.search(r"(?m)^\s*查\s*[:：]\s*(.+?)\s*$", raw)
+            tm = re.search(r"(?m)^\s*想\s*[:：]\s*(.+?)\s*$", raw)
+            dm = re.search(r"(?m)^\s*判断\s*[:：]\s*(.+?)\s*$", raw)
+            decision = (dm.group(1).strip() if dm else "")
+            if is_group and (("不回" in decision) or ("不接" in decision)
+                             or re.match(r"^\s*不回\s*$", raw)):
+                self._log_two_stage(event, text, "不回", query="", thought="", raw=raw)
+                try:
+                    event.stop_event()
+                except Exception:
+                    pass
+                logger.info("[memory] 两段式群聊：判断不回，跳过主回复")
+                return
+            query = (qm.group(1).strip()[:100] if qm else "")
+            thought = (tm.group(1).strip()[:240] if tm else "")
+            if not query and not thought:
+                self._log_two_stage(event, text, "回" if is_group else "私聊",
+                                    query="", thought="", raw=raw)
+                return
+            block = ""
+            materials = ""
+            # 保留第一段的“想”，但标明是查前猜想；第二段看到材料后可以推翻。
+            if thought:
+                label = "【查之前的猜想·不一定对】" if query else "【你自己先过了一遍】"
+                block += f"{label}\n{thought}\n"
+            if query:
+                materials = await asyncio.to_thread(self._two_stage_lookup, query, event)
+                if materials:
+                    block += f"\n【可能相关，不一定】\n{materials}\n"
+            self._log_two_stage(event, text, "回" if (is_group or query or thought) else "",
+                                query=query, thought=thought, raw=raw, materials=materials)
+            if not block:
+                return
+            block += "\n（这是内部材料，不是结论；材料和你之前想的不一样时，以材料为准；不够可以再查。）"
+            parts = list(getattr(req, "extra_user_content_parts", None) or [])
+            parts.append(TextPart(text=block))
+            req.extra_user_content_parts = parts
+            logger.info(f"[memory] 两段式：想 {len(thought)} 字，查 {query[:40]}，材料 {len(materials) if query else 0} 字")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[memory] 两段式出错：{type(e).__name__}: {e}")
+
+    def _group_directed(self, event) -> bool:
+        try:
+            if bool(getattr(event, "is_at_or_wake_command", False)):
+                return True
+        except Exception:
+            pass
+        try:
+            from astrbot.api.message_components import At, Reply
+            self_id = str(event.get_self_id() or "")
+            for comp in event.get_messages() or []:
+                if At and isinstance(comp, At) and str(getattr(comp, "qq", "")) == self_id:
+                    return True
+                if Reply and isinstance(comp, Reply) and str(getattr(comp, "sender_id", "")) == self_id:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _two_stage_want(self, event, text: str) -> bool:
+        if not bool(self._cfg("recall_two_stage_enabled", False)):
+            return False
+        if not text or text.startswith("/"):
+            return False
+        try:
+            is_private = bool(event.is_private_chat())
+        except Exception:
+            return False
+        if is_private:
+            if bool(self._cfg("recall_two_stage_cues_only", True)) and not _TWO_STAGE_CUES.search(text):
+                return False
+        else:
+            if not bool(self._cfg("recall_two_stage_group_enabled", False)):
+                return False
+            if (bool(self._cfg("recall_two_stage_group_directed_only", True))
+                    and not self._group_directed(event)):
+                return False
+        now = time.time()
+        cooldown = float(self._cfg("recall_two_stage_cooldown_sec", 20) or 0)
+        last = (getattr(self, "_two_stage_last", {}) or {}).get(event.unified_msg_origin, 0.0)
+        if cooldown and now - last < cooldown:
+            return False
+        if getattr(self, "_two_stage_last", None) is None:
+            self._two_stage_last = {}
+        self._two_stage_last[event.unified_msg_origin] = now
+        return True
+
+    async def _two_stage_provider(self, event):
+        pid = ""
+        try:
+            pid = await self.context.get_current_chat_provider_id(event.unified_msg_origin) or ""
+        except Exception:
+            pid = ""
+        prov = self.context.get_provider_by_id(pid) if pid else None
+        if prov is None:
+            try:
+                prov = self.context.get_using_provider(umo=event.unified_msg_origin)
+            except Exception:
+                prov = None
+        return prov
+
+    def _two_stage_scope(self, event) -> str:
+        try:
+            if event.is_private_chat():
+                return "private"
+        except Exception:
+            pass
+        try:
+            gid = str(event.get_group_id() or "")
+        except Exception:
+            gid = ""
+        return f"group:{gid}" if gid else "group"
+
+    def _log_two_stage(self, event, user_text: str, decision: str,
+                       query: str = "", thought: str = "", raw: str = "",
+                       materials: str = "") -> None:
+        try:
+            st = Store(self.db_path)
+            try:
+                st.add_two_stage_log(
+                    event.unified_msg_origin, self._two_stage_scope(event),
+                    user_text, decision, query, thought, raw, materials)
+            finally:
+                st.close()
+        except Exception as e:  # noqa: BLE001
+            logger.info(f"[memory] 预想记录失败：{type(e).__name__}: {e}")
+
+    def _two_stage_lookup(self, query: str, event) -> str:
+        try:
+            since, until = _auto_time_bounds(query, "", "")
+            scope = self._two_stage_scope(event)
+            st = Store(self.db_path)
+            try:
+                hits = retriever.search(st, query, top_k=3,
+                                        since=since, until=until, scope=scope)
+                floor = float(self._cfg("recall_min_score", 0.30) or 0.30)
+                hits = [h for h in hits if float(h.get("score") or 0) >= floor]
+                try:
+                    st.log_recall_query(
+                        event.unified_msg_origin, query, len(hits),
+                        degraded=bool(retriever.embedding_status().get("disabled")),
+                        sort="", scope=scope, since=since, until=until,
+                        results=[{"id": int(h.get("id") or 0),
+                                  "kind": h.get("kind") or "",
+                                  "score": round(float(h.get("score") or 0), 3),
+                                  "text": str(h.get("text") or "")[:200]}
+                                 for h in hits[:10]],
+                        trigger="two_stage")
+                except Exception:
+                    pass
+            finally:
+                st.close()
+            lines = []
+            for h in hits[:3]:
+                when = _fmt_when(str(h.get("anchor_time") or ""))
+                lines.append(f"#{h.get('id')} [{h.get('kind')}] {str(h.get('text') or '')[:180]}"
+                             + (f"（{when}）" if when else ""))
+            return "\n".join(lines)
+        except Exception as e:  # noqa: BLE001
+            logger.info(f"[memory] 两段式查记忆失败：{type(e).__name__}: {e}")
+            return ""
 
     @filter.on_llm_request()
     async def on_request_capability(self, event: AstrMessageEvent, req):
@@ -1387,7 +1806,7 @@ class DafeiyuMemory(Star):
             since(string): 可选，只看这之后：2026-11-10 / 昨天 / 最近3天 / 7天前
             until(string): 可选，只看这之前：2026-11-12 / 今天
             scope(string): 可选，场景：私聊 / 群聊 / 群:123456
-            person(string): 可选，关于谁：婉清 / 群友A / 群友B（按正文和主题词匹配）
+            person(string): 可选，关于谁：婉清 / 秋夜 / 董汐（按正文和主题词匹配）
             sort(string): 排序：relevance（默认，按相关度）/ time（按时间，早→晚）
         '''
         try:
@@ -1396,6 +1815,7 @@ class DafeiyuMemory(Star):
             until_d = _date_bound(until)
             if since_d is None or until_d is None:
                 return "时间没看懂。写 2026-11-10、昨天、最近3天、7天前 这种。"
+            since_d, until_d = _auto_time_bounds(query, since_d or "", until_d or "")
             if since_d and until_d and since_d > until_d:
                 return "开始时间比结束时间晚，倒过来了。"
             scope_f = _scope_value(scope)
@@ -1404,13 +1824,104 @@ class DafeiyuMemory(Star):
             person_f = (person or "").strip()
             if person_f.startswith("关于"):
                 person_f = person_f[2:].strip()
-            hits = await asyncio.to_thread(
-                self._search_in_thread, query or "", int(limit or 5), kind or "",
-                since_d or "", until_d or "", scope_f or "", person_f)
+            if query.strip():
+                hits = await asyncio.to_thread(
+                    self._search_in_thread, query or "", int(limit or 5), kind or "",
+                    since_d or "", until_d or "", scope_f or "", person_f)
+            else:
+                hits = await asyncio.to_thread(
+                    self._recent_in_thread, kind or "", int(limit or 5),
+                    since_d or "", until_d or "", scope_f or "", person_f)
+                for h in hits:
+                    h["score"] = 0.0
+            try:
+                floor = float(self._cfg("recall_min_score", 0.30))
+            except (TypeError, ValueError):
+                floor = 0.30
+            if since_d or until_d:
+                try:
+                    floor = max(floor, float(self._cfg("recall_time_min_score", 0.45)))
+                except (TypeError, ValueError):
+                    floor = max(floor, 0.45)
+            if query.strip():
+                hits = [h for h in hits if float(h.get("score") or 0) >= floor]
+                _related = _related_terms(query)
+                if _related and (not hits or float(hits[0].get("score") or 0) < 0.55):
+                    try:
+                        extra = await asyncio.to_thread(
+                            self._search_in_thread, " ".join(_related), int(limit or 5),
+                            kind or "", since_d or "", until_d or "", scope_f or "", person_f)
+                        best = {int(h["id"]): h for h in hits}
+                        for h in extra:
+                            if float(h.get("score") or 0) < floor:
+                                continue
+                            tid = int(h["id"])
+                            if tid not in best or float(h.get("score") or 0) > float(best[tid].get("score") or 0):
+                                best[tid] = h
+                        hits = sorted(best.values(), key=lambda h: -float(h.get("score") or 0))
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"[memory] 相关词检索失败：{type(e).__name__}: {e}")
+            meal_fallback = []
+            if (not hits and (since_d or until_d) and _meal_fallback_needed(query)):
+                try:
+                    window = await asyncio.to_thread(
+                        self._recent_in_thread, "", 40, since_d or "", until_d or "",
+                        scope_f or "", person_f)
+                    food_marks = ("吃", "饭", "餐", "外卖", "汉堡", "面", "米",
+                                  "零食", "夜宵", "烧烤", "火锅")
+                    meal_fallback = [h for h in window
+                                     if any(x in str(h.get("text") or "") for x in food_marks)][:5]
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[memory] 吃饭时间兜底失败：{type(e).__name__}: {e}")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[memory] recall_memory 出错：{type(e).__name__}: {e}", exc_info=True)
             return f"翻不动：{type(e).__name__}"
-        if not hits:
+        try:
+            _results = [
+                {"id": int(h.get("id") or 0), "kind": h.get("kind") or "",
+                 "score": round(float(h.get("score") or 0), 3),
+                 "text": str(h.get("text") or "")[:200]}
+                for h in hits[:10]
+            ]
+            store.log_recall_query(
+                event.unified_msg_origin, query or "", len(hits),
+                degraded=bool(retriever.embedding_status().get("disabled")),
+                sort=sort or "", scope=scope_f or "", kind=kind or "",
+                person=person_f, since=since_d or "", until=until_d or "",
+                results=_results, trigger="tool",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[memory] 检索日志写入失败：{type(e).__name__}: {e}")
+        raw_hits = []
+        try:
+            if query and not kind and not person_f:
+                _mq = _raw_match_query(query)
+                if _mq:
+                    raw_hits = await asyncio.to_thread(
+                        store.raw_fts_search, _mq, 3,
+                        event.unified_msg_origin, since_d or "", until_d or "")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[memory] 原话检索失败：{type(e).__name__}: {e}")
+        self_hits = []
+        try:
+            if bool(self._cfg("self_thought_recall", False)):
+                want_self = (kind or "") == "self" or any(
+                    x in (query or "") for x in ("我", "自己", "最近", "想想"))
+                if want_self:
+                    terms = _self_terms(query)
+                    if terms:
+                        self_hits = await asyncio.to_thread(
+                            self._self_thoughts_in_thread, terms, 5,
+                            event.unified_msg_origin, since_d or "", until_d or "", False)
+                    elif (kind or "") == "self":
+                        self_hits = await asyncio.to_thread(
+                            self._self_thoughts_in_thread, [], 5,
+                            event.unified_msg_origin, since_d or "", until_d or "", True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[memory] 自我思考检索失败：{type(e).__name__}: {e}")
+        if not hits and not raw_hits and not self_hits and not meal_fallback:
+            if since_d or until_d:
+                return f"{since_d or '开始'} 到 {until_d or '现在'} 没找到相关的。"
             return "没找到相关的。"
         sort_mode = _sort_mode(sort)
         if not sort_mode:
@@ -1423,7 +1934,38 @@ class DafeiyuMemory(Star):
         self._remember_recall(event, hits)
         order_label = "按时间" if sort_mode == "time" else "相关"
         title = "材料（按时间排，早→晚）：" if sort_mode == "time" else "材料（按相关度排）："
-        return self._render_hits(store, hits, title, order_label, sort_mode)
+        out = self._render_hits(store, hits, title, order_label, sort_mode) if hits else "材料（没找到提炼过的）："
+        if raw_hits:
+            rlines = ["【原话】"]
+            for r in raw_hits:
+                who = "我" if (r.get("role") or "") == "assistant" else (r.get("sender") or "对方")
+                rlines.append(f"{_fmt_when(str(r.get('created_at') or ''))} · {who}："
+                              f"{str(r.get('text') or '')[:300]}")
+            out += "\n\n" + "\n".join(rlines)
+        if self_hits:
+            slines = ["【我自己写的】"]
+            for s in self_hits:
+                slines.append(f"{_fmt_when(str(s.get('created_at') or ''))} · "
+                              f"第 {s.get('tick_no')} 次：{str(s.get('text') or '')[:300]}")
+            out += "\n\n" + "\n".join(slines)
+        if hits:
+            try:
+                companion = store.episode_companion(int(hits[0]["id"]))
+            except Exception:
+                companion = None
+            if companion:
+                out += ("\n\n【同段的一条】\n"
+                        f"#{companion['id']} [{companion['kind']}]："
+                        f"{str(companion.get('text') or '')[:200]}\n"
+                        "（只是同一段材料，不一定因果。）")
+        if meal_fallback:
+            lines = ["【时间附近的记录】"]
+            for h in meal_fallback:
+                lines.append(f"{_fmt_when(str(h.get('anchor_time') or ''))} · "
+                             f"#{h.get('id')}：{str(h.get('text') or '')[:200]}")
+            lines.append("（原文没写“晚饭”，只是在这个时间段。）")
+            out += "\n\n" + "\n".join(lines)
+        return out
 
     @filter.llm_tool(name="sort_last_recall")
     async def sort_last_recall(self, event: AstrMessageEvent, sort: str = "time"):
@@ -1952,6 +2494,18 @@ class DafeiyuMemory(Star):
             out.append(f"推断（{c:.1f}）：{t['inference']}" if isinstance(c, (int, float)) else f"推断：{t['inference']}")
         if _other:
             out.append("旁注：" + "；".join(n["text"][:200] for n in _other[:3]))
+        try:
+            neighbors = store.temporal_neighbors(int(memory_id), limit=5)
+        except Exception:
+            neighbors = []
+        if neighbors:
+            kind_name = {"fact": "事实", "observation": "观察",
+                         "self": "自我", "speculation": "推测"}
+            out.append("【同一段里】")
+            for n in neighbors:
+                gap = f" · 约 {n['delta_min']} 分钟" if n.get("delta_min") is not None else ""
+                out.append(f"- {kind_name.get(n['kind'], n['kind'])} #{n['id']}{gap}：{n['text'][:80]}")
+            out.append("（只是同一段对话，不一定相关。）")
         if original:
             try:
                 transcript = store.episode_transcript(int(memory_id))
@@ -1990,7 +2544,8 @@ class DafeiyuMemory(Star):
         try:
             store = self._db()
             rows = store.conn.execute(
-                """SELECT t.id, t.kind, v.text, t.created_at, t.due_at, t.scope, t.episode_id
+                """SELECT t.id, t.kind, v.text, t.created_at, t.due_at,
+                          t.due_hint, t.scope, t.episode_id
                    FROM trace t JOIN trace_version v ON v.id=t.head_version_id
                    WHERE t.kind IN ('unresolved','promise') AND t.status='active'
                      AND COALESCE(t.state,'open') IN ('open','missed')
@@ -2003,9 +2558,10 @@ class DafeiyuMemory(Star):
         lines = []
         for r in rows:
             due = str(r["due_at"] or "")
+            hint = str(r["due_hint"] or "")
             when = _fmt_when(due or r["created_at"])
             if when:
-                when = ("到期 " + when) if due else ("记下 " + when)
+                when = ("到期 " + when) if due else ("笼统 " + hint if hint else "记下 " + when)
             scene = _scene_label(str(r["scope"] or ""),
                                  sessions.get(int(r["episode_id"] or 0), ""))
             header = " · ".join(x for x in (when, scene) if x)
@@ -2027,7 +2583,7 @@ class DafeiyuMemory(Star):
         try:
             store = self._db()
             rows = store.conn.execute(
-                """SELECT t.id, t.kind, t.created_at, t.scope, t.episode_id,
+                """SELECT t.id, t.kind, t.created_at, t.due_hint, t.scope, t.episode_id,
                           COALESCE(t.state,'open') AS st, v.text
                    FROM trace t JOIN trace_version v ON v.id=t.head_version_id
                    WHERE t.kind IN ('unresolved','promise','agreement') AND t.status='active'
@@ -2042,9 +2598,11 @@ class DafeiyuMemory(Star):
         lines = ["这些一直没下文："]
         for r in rows:
             when = _fmt_when(r["created_at"])
+            hint = str(r["due_hint"] or "")
             scene = _scene_label(str(r["scope"] or ""),
                                  sessions.get(int(r["episode_id"] or 0), ""))
-            header = " · ".join(x for x in (("记下 " + when) if when else "", scene) if x)
+            stamp = ("笼统 " + hint) if hint else (("记下 " + when) if when else "")
+            header = " · ".join(x for x in (stamp, scene) if x)
             if header:
                 lines.append("")
                 lines.append(header)
@@ -2075,7 +2633,180 @@ class DafeiyuMemory(Star):
         except Exception as e:  # noqa: BLE001
             return f"没改成功：{type(e).__name__}"
 
+    @filter.llm_tool(name="write_self_model")
+    async def write_self_model(self, event: AstrMessageEvent, text: str):
+        '''写下你现在的自我模型：你怎么看自己、在意什么、最近在改什么。
+
+        只能你自己写；系统不代写。旧版本会保留。
+
+        Args:
+            text(string): 1–800 字，第一人称
+        '''
+        text = (text or "").strip()
+        if not text:
+            return "没写内容。"
+        if len(text) > 800:
+            text = text[:800]
+        try:
+            self._db().add_self_model(text)
+            return "写下了。旧的还在。"
+        except Exception as e:  # noqa: BLE001
+            return f"没写下：{type(e).__name__}"
+
+    @filter.llm_tool(name="read_self_model")
+    async def read_self_model(self, event: AstrMessageEvent):
+        '''读你自己写下的自我模型；不总结、不评价。'''
+        try:
+            st = self._db()
+            cur = st.current_self_model()
+            hist = st.self_model_history(4)
+        except Exception as e:  # noqa: BLE001
+            return f"读不了：{type(e).__name__}"
+        if not cur:
+            return "你还没有写下自我模型。"
+        lines = [f"现在的自我模型（{cur['created_at'][:16]}）：", cur["text"]]
+        older = [x for x in hist if x["id"] != cur["id"]]
+        if older:
+            lines.append("以前的：")
+            for x in older[:3]:
+                lines.append(f"- {x['created_at'][:10]}：{x['text'][:200]}")
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="read_person_impression")
+    async def read_person_impression(self, event: AstrMessageEvent, name: str = ""):
+        '''读一个人的人物印象，按“她对我来说是谁”来看，不是用户档案。
+
+        只在私聊用；群聊不读，避免把私聊印象带进群。
+
+        Args:
+            name(string): 人物名；留空 = 当前私聊对象
+        '''
+        try:
+            if not event.is_private_chat():
+                return "人物印象只在私聊看。"
+        except Exception:
+            pass
+        base = os.path.dirname(os.path.dirname(self.db_path))
+        who = (name or "").strip()
+        try:
+            if not who:
+                who = event.get_sender_name() or ""
+            qq = event.get_sender_id() or ""
+            d = _find_person_impression(base, who, qq)
+        except Exception as e:  # noqa: BLE001
+            return f"读不了人物印象：{type(e).__name__}"
+        if not d:
+            return "还没有这个人的印象。"
+        lines = [f"【人物印象 · {d.get('name') or who}】"]
+        if d.get("relationship"):
+            lines.append("关系：" + str(d["relationship"]))
+        if d.get("summary"):
+            lines.append("我眼里的这个人：" + str(d["summary"])[:240])
+        if d.get("special_comment"):
+            lines.append("我自己的话：" + str(d["special_comment"])[:160])
+        if d.get("preferences"):
+            lines.append("相处时记得：" + "、".join(map(str, d["preferences"][:6])))
+        if d.get("evidence_dates"):
+            lines.append("证据日期：" + "、".join(map(str, d["evidence_dates"][-5:])))
+        lines.append("（旧档案，可能过时；细节用 read_impression。）")
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="read_self")
+    async def read_self(self, event: AstrMessageEvent, days: int = 7):
+        '''看看最近的自己：你自己选择留下的自我观察和选择。
+
+        只列原文，不总结你是什么样的人。
+
+        Args:
+            days(int): 最近几天，默认 7
+        '''
+        try:
+            from datetime import date, timedelta
+            n = max(1, min(30, int(days or 7)))
+            since = (date.today() - timedelta(days=n - 1)).isoformat()
+            store = self._db()
+            rows = store.conn.execute(
+                """SELECT t.id, v.text, COALESCE(v.anchor_time, t.created_at) AS at
+                   FROM trace t
+                   JOIN trace_version v ON v.id=t.head_version_id
+                   JOIN episode e ON e.id=t.episode_id
+                   WHERE t.kind='self' AND t.status='active' AND t.avoided=0
+                     AND e.session_id=? AND date(COALESCE(v.anchor_time, t.created_at))>=date(?)
+                   ORDER BY at DESC LIMIT 8""",
+                (event.unified_msg_origin, since)).fetchall()
+        except Exception as e:  # noqa: BLE001
+            return f"看不了最近的自己：{type(e).__name__}"
+        lines = [f"最近 {n} 天，你自己选择留下的："]
+        if rows:
+            lines.append("【自我记忆】")
+            for r in rows:
+                lines.append(f"- {_fmt_when(str(r['at'] or ''))} #{r['id']}：{str(r['text'] or '')[:160]}")
+        if len(lines) == 1:
+            return f"最近 {n} 天，你没有留下关于自己的东西。"
+        lines.append("（只是列出来；怎么看你、要不要接着想，你自己定。）")
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="self_think")
+    async def self_think_tool(self, event: AstrMessageEvent, action: str = "start"):
+        '''自己决定安静想一会儿，或者结束这次思考。
+
+        想自己待一会儿、整理一件事、想想自己时用。
+        开始后不会发消息，只写自己的记录；有人找你会自动暂停。
+
+        Args:
+            action(string): start=开始/接续；stop=不想了，结束这次
+        '''
+        if not bool(self._cfg("self_think_enabled", False)):
+            return "自我思考现在是关着的。"
+        act = (action or "start").strip().lower()
+        if act in ("stop", "end", "停", "结束"):
+            res = await self._self_thinker.stop_now()
+            return "好，不想了。" if res == "stopped" else "现在没有在想的。"
+        res = await self._self_thinker.force()
+        return {
+            "started": "好，我自己想一会儿。",
+            "resumed": "接着刚才想。",
+            "thinking": "已经在想了。",
+            "no_session": "没有可用的私聊会话，想不了。",
+        }.get(res, "好。")
+
     # ---------- 命令 ----------
+
+    @filter.command("自我思考")
+    async def self_think_now(self, event: AstrMessageEvent, arg: str = ""):
+        """管理员手动叫她开始想；可以带一条记忆编号，如 /自我思考 #2919。"""
+        if not event.is_admin():
+            yield event.plain_result("这个只有管理员能叫。")
+            return
+        if not bool(self._cfg("self_think_enabled", False)):
+            yield event.plain_result("自我思考现在是关着的。")
+            return
+        seed_id = 0
+        raw = (arg or "").strip().lstrip("#").strip()
+        if raw:
+            if not raw.isdigit():
+                yield event.plain_result("用法：/自我思考 或 /自我思考 #记忆编号")
+                return
+            seed_id = int(raw)
+            try:
+                t = self._db().get_trace(seed_id)
+            except Exception:
+                t = None
+            if not t:
+                yield event.plain_result(f"没找到 #{seed_id}。")
+                return
+        try:
+            res = await self._self_thinker.force(seed_id)
+        except Exception as e:  # noqa: BLE001
+            yield event.plain_result(f"没叫醒：{type(e).__name__}")
+            return
+        msg = {
+            "started": f"好，去看看 #{seed_id}。" if seed_id else "好，现在开始想。",
+            "resumed": f"接着想，带上 #{seed_id}。" if seed_id else "接着上次想。",
+            "thinking": f"已经在想了，把 #{seed_id} 放进去。" if seed_id else "已经在想了。",
+            "no_session": "没有可用的私聊会话，想不了。",
+        }.get(res, "好。")
+        yield event.plain_result(msg)
 
     @filter.command("mem")
     async def mem(self, event: AstrMessageEvent, sub: str = "", arg: str = ""):

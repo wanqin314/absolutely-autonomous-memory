@@ -46,15 +46,22 @@ TEMPLATE = """下面是一段刚发生的对话（格式：[角色] 内容，你
 
 {open_items}
 
+提炼时先看「我」这一侧，再看世界：
+1. 我做了什么、没做什么？
+2. 我当时什么感觉？（felt）
+3. 我选了什么、没选什么？（reaction）
+4. 后来我怎么看这个选择？
+有就写，没有就不硬凑；self 不是自我评价，不要写「我就是……的人」。
+
 请挑出值得长期留下的，输出 JSON：
-{{"items":[{{"kind":"...","text":"...","importance":0.5,"certainty":null,"event_time":null,"due_at":null,"due_time":null,"recur":null,"entities":["..."],"topics":["..."],"anchor_quote":"...","felt":"闷","reaction":"没接话","inference":"她可能累了","inference_certainty":0.6,"tags":["..."]}}],
+{{"items":[{{"kind":"...","text":"...","importance":0.5,"certainty":null,"event_time":null,"due_at":null,"due_time":null,"due_hint":null,"recur":null,"entities":["..."],"topics":["..."],"anchor_quote":"...","felt":"闷","reaction":"没接话","inference":"她可能累了","inference_certainty":0.6,"tags":["..."]}}],
  "updates":[{{"id":123,"state":"settled|void|open","note":"一句话说明"}}]}}
 
 kind 只能是这六种：
 - fact：他明确说过的、关于他自己的事实（喜好、习惯、身份、正在忙的事、家人朋友）
 - observation：你观察到的（他的状态、气氛、你们之间发生了什么）
 - speculation：你的猜测或推断（必须给 certainty，0~1）
-- self：你自己此刻的想法、感受、在意的事
+- self：你自己此刻的想法、感受、选择（不是「我是个……」的自我评价）
 - unresolved：还没了结的事（他没回的、你等着问的）
 - promise：他说定或答应的事，**且有明确时间或明确待办**（例如「十点半前写日记」）
 - agreement：**没有时间的承诺/长期说法**（例如「以后不舒服就直接说」「饿了会喊他」）
@@ -64,7 +71,8 @@ kind 只能是这六种：
 - text 用第一人称，40 字以内，像你心里记下的一笔，不是事件报告
 - **text 只写发生的事和可观察的动作/原话**；不写「她有点烦」「我觉得他…」这种替人下的判断
 - felt：当时的感觉，1–3 个模糊词就行（闷 / 松 / 急 / 憋着 / 说不清），不要写成一整句
-- reaction：你当时的反应（动作或原话），不解释
+- reaction：你当时的反应（动作、原话，或你选了什么/没选什么），不解释
+- self 只写这一次的经历和选择，不写「我总是」「我就是」这种性格结论；一次情绪不升级成性格
 - inference：你对别人的推断（如「她可能累了」），必须配 inference_certainty（0–1）；没有推断就留空
 - 一条只写一件事；不要写「他跟我说…然后我说…」这种过程
 - **写名字，不要写「他」「她」**：对话行方括号里的名字就是说话人；如果那里只有「他」「她」，才用代词
@@ -90,6 +98,8 @@ kind 只能是这六种：
   比如「十点半前写日记」→ 当天 22:30；「明早九点叫我」→ 次日 09:00；「明天下午接我」→ 明天那个时刻。
   **填了才会到点提醒，不填就永远不会提醒**，所以原文给了时间就一定要填。
   说不出确切时刻才填 null，**不许猜**；不是约定一律 null。
+- due_hint：**只有 promise / unresolved 才填**。原文只给了笼统时段（早上/中午/下午/晚上/睡前/饭后/明早/今晚/周末）时，照抄这个短语；
+  不要把它换算成具体时刻，也不要因此填 due_at。没有就 null。
 - due_time / recur：**只有循环约定才填**。
   「以后每天早上叫我起床」「每天提醒我吃药」→ recur="daily"，due_time="07:00"，
   due_at 留空（系统按 due_time 算下一次）。
@@ -226,6 +236,8 @@ def parse_items(text: str) -> tuple[list[dict], list[dict]]:
                       if it.get("kind") == "promise" else None,
             "due_time": (str(it.get("due_time") or "").strip()[:5] or None)
                         if it.get("kind") == "promise" else None,
+            "due_hint": (str(it.get("due_hint") or "").strip()[:32] or None)
+                        if it.get("kind") in ("promise", "unresolved") else None,
             "recur": ("daily" if str(it.get("recur") or "").strip().lower() == "daily" else "")
                      if it.get("kind") == "promise" else "",
             "anchor_quote": str(it.get("anchor_quote") or "").strip()[:200] or None,
@@ -640,6 +652,7 @@ def settle_with_fact(store, oid: int, state: str, why: str, candidates: list[str
             f"以前记着：#{oid}「{promise_text[:30]}」。"
             f"后来知道：{reason}。"
             "算不算了结，你自己看。",
+            oid,
         )
     return {"id": oid, "state": state, "why": why, "as_fact": src[0] if src else None}
 
@@ -660,7 +673,7 @@ SELF_TEMPLATE = """她自己的说法：
 - 只是情绪、喜好、态度（「我有点怕」「我喜欢他」）被事实影响，不算纠正，不要列出
 - 拿不准就不要列
 
-只输出 JSON：{{"revised":[{{"id":123,"note":"不超过 25 字，说明事实是什么"}}]}}
+只输出 JSON：{{"revised":[{{"id":123,"note":"不超过 25 字，说明事实是什么","text":"如果直接推翻事实性判断，用第一人称改写成新的事实性说法；不改情绪、喜好、态度；拿不准就省略"}}]}}
 """
 
 SELF_MAX = 3
@@ -711,6 +724,16 @@ async def reconcile_self(store, new_texts: list[str], provider) -> list[dict]:
         note = str(u.get("note") or "").strip()[:40]
         if not note:
             continue
+        revised_text = str(u.get("text") or "").strip()[:240]
+        if revised_text:
+            try:
+                store.add_version(sid, revised_text, reason="correct",
+                                  caused_by_type="correction",
+                                  caused_by_id=str(fact_id) if fact_id else "",
+                                  change_class="major")
+                logger.info(f"[memory] 事实改写自我 #{sid}：{revised_text[:50]}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[memory] 事实改写自我失败 #{sid}：{type(e).__name__}: {e}")
         store.add_note(sid, f"有新事实纠正了这条判断：{note}" + (f"（见 #{fact_id}）" if fact_id else ""),
                        kind="evidence")
         if fact_id:
@@ -820,7 +843,8 @@ def write_items(store, items: list[dict], lines: list[dict], scope: str, session
                 near, it["text"], reason="reconsolidation", caused_by_type="episode",
                 change_class="minor", anchor_quote=it.get("anchor_quote") or "",
                 event_time=it.get("event_time") or "", due_at=it.get("due_at") or "",
-            due_time=it.get("due_time") or "", recur=it.get("recur") or "",
+                due_time=it.get("due_time") or "", recur=it.get("recur") or "",
+                due_hint=it.get("due_hint") or "",
             topics=it.get("topics") or [],
             felt=it.get("felt") or "", reaction=it.get("reaction") or "",
             inference=it.get("inference") or "",
@@ -836,6 +860,7 @@ def write_items(store, items: list[dict], lines: list[dict], scope: str, session
             anchor_quote=it.get("anchor_quote") or "", anchor_time=last_ts,
             event_time=it.get("event_time") or "",
             due_at=it.get("due_at") or "", due_time=it.get("due_time") or "",
+            due_hint=it.get("due_hint") or "",
             recur=it.get("recur") or "", topics=it.get("topics") or [],
             certainty=it.get("certainty"), tags=it.get("tags") or [],
             felt=it.get("felt") or "", reaction=it.get("reaction") or "",

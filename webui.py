@@ -119,6 +119,124 @@ def api_resident(all: int = 0):
         s.close()
 
 
+@app.get("/api/looks")
+def api_looks(limit: int = 100):
+    """群聊 <look> 观察记录，只读本地 JSONL。"""
+    import json as _json
+    from collections import deque
+
+    base = os.path.dirname(os.path.dirname(DB))
+    path = os.path.join(base, "astrbot_plugin_group_extras", "look.jsonl")
+    old = os.path.join(base, "astrbot_plugin_group_look", "look.jsonl")
+    if not os.path.exists(path) and os.path.exists(old):
+        path = old
+    if not os.path.exists(path):
+        return []
+    n = max(1, min(500, int(limit or 100)))
+    try:
+        with open(path, encoding="utf-8-sig", errors="ignore") as f:
+            lines = deque(f, maxlen=n)
+        out = []
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(_json.loads(line))
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return []
+
+
+@app.get("/api/recall_queries")
+def api_recall_queries(limit: int = 100):
+    """最近的检索调用记录；包括 0 命中。"""
+    s = db()
+    try:
+        n = max(1, min(500, int(limit or 100)))
+        rows = s.conn.execute(
+            """SELECT id, session_id, query, hits, degraded, sort, trigger, scope,
+                      kind, person, results, since, until, created_at
+               FROM recall_query_log ORDER BY id DESC LIMIT ?""", (n,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["results"] = json.loads(d.get("results") or "[]")
+            except Exception:
+                d["results"] = []
+            out.append(d)
+        return out
+    except Exception:
+        return []
+    finally:
+        s.close()
+
+
+@app.get("/api/two_stage")
+def api_two_stage(limit: int = 100):
+    """两段式第一段的预想记录：用户消息、判断、查词、想法、材料。"""
+    s = db()
+    try:
+        return s.recent_two_stage_logs(max(1, min(300, int(limit or 100))))
+    except Exception:
+        return []
+    finally:
+        s.close()
+
+
+@app.get("/api/self")
+def api_self(days: int = 30):
+    """最近的自我的观察与自我思考；只读。"""
+    from datetime import date, timedelta
+    try:
+        n = max(1, min(365, int(days or 30)))
+        since = (date.today() - timedelta(days=n - 1)).isoformat()
+        s = db()
+        try:
+            traces = s.conn.execute(
+                """SELECT t.id, t.kind, v.text, COALESCE(v.anchor_time, t.created_at) AS at,
+                          e.session_id
+                   FROM trace t
+                   JOIN trace_version v ON v.id=t.head_version_id
+                   LEFT JOIN episode e ON e.id=t.episode_id
+                   WHERE t.kind='self' AND t.status='active' AND t.avoided=0
+                     AND date(COALESCE(v.anchor_time, t.created_at))>=date(?)
+                   ORDER BY at DESC LIMIT 200""", (since,)).fetchall()
+            thoughts = s.conn.execute(
+                """SELECT id, session_id, tick_no, text, status, created_at
+                   FROM self_thought WHERE date(created_at)>=date(?)
+                   ORDER BY id DESC LIMIT 200""", (since,)).fetchall()
+            return {"since": since, "traces": [dict(r) for r in traces],
+                    "thoughts": [dict(r) for r in thoughts]}
+        finally:
+            s.close()
+    except Exception:
+        return {"since": "", "traces": [], "thoughts": []}
+
+
+@app.get("/api/self_thoughts")
+def api_self_thoughts(days: int = 30):
+    """思考过程：不参与检索，也不等于她选择留下的记忆。"""
+    from datetime import date, timedelta
+    try:
+        n = max(1, min(365, int(days or 30)))
+        since = (date.today() - timedelta(days=n - 1)).isoformat()
+        s = db()
+        try:
+            rows = s.conn.execute(
+                """SELECT id, session_id, tick_no, text, status, created_at
+                   FROM self_thought WHERE date(created_at)>=date(?)
+                   ORDER BY id DESC LIMIT 300""", (since,)).fetchall()
+            return {"since": since, "thoughts": [dict(r) for r in rows]}
+        finally:
+            s.close()
+    except Exception:
+        return {"since": "", "thoughts": []}
+
+
 @app.get("/api/series/{sid}")
 def api_series_one(sid: int):
     s = db()
@@ -164,7 +282,7 @@ def api_unresolved():
     s = db()
     try:
         rows = s.conn.execute(
-            """SELECT t.id, t.kind, v.text, t.created_at, t.due_at,
+            """SELECT t.id, t.kind, v.text, t.created_at, t.due_at, t.due_hint,
                       COALESCE(t.state,'open') state
                FROM trace t
                JOIN trace_version v ON v.id=t.head_version_id
@@ -409,6 +527,11 @@ textarea{width:100%;min-height:60px;background:var(--panel);border:1px solid var
       <button id="tab-tags" onclick="loadTags()">按主题</button>
       <button id="tab-series" onclick="loadSeries()">系列</button>
       <button id="tab-resident" onclick="loadResident()">常驻区</button>
+      <button id="tab-looks" onclick="loadLooks()">先看</button>
+      <button id="tab-recall" onclick="loadRecallQueries()">检索</button>
+      <button id="tab-pre" onclick="loadTwoStage()">预想</button>
+      <button id="tab-self" onclick="loadSelf()">自我</button>
+      <button id="tab-thoughts" onclick="loadThoughts()">思考</button>
       <button id="tab-ov" onclick="loadOverview()">总览</button>
       <button id="tab-st" onclick="loadStats()">统计</button>
       <button id="tab-raw" onclick="loadRaw()">原话</button>
@@ -420,7 +543,7 @@ textarea{width:100%;min-height:60px;background:var(--panel);border:1px solid var
 <script>
 let cur=null;
 const KIND={fact:'事实',observation:'观察',speculation:'推测',self:'自我',unresolved:'未了',promise:'约定',agreement:'说好的'};
-const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 async function j(u,o){const r=await fetch(u,o);return r.json()}
 async function stats(){const d=await j('/api/stats');
   document.getElementById('stats').textContent =
@@ -444,19 +567,37 @@ async function loadRecent(){setTab('tab-recent');const d=await j('/api/recent?li
   const rows=kindFilter?d.filter(r=>r.kind===kindFilter):d;
   document.getElementById('list').innerHTML = kindBar() +
     (rows.length?rows.slice(0,60).map(item).join(''):'<div class="empty">这一类还没有记忆</div>');}
-async function loadUnresolved(){setTab('tab-unres');const d=await j('/api/unresolved');
-  const timed=d.filter(r=>r.due_at), untimed=d.filter(r=>!r.due_at);
+async function loadUnresolved(){setTab('tab-unres');
+  const d=await j('/api/unresolved');
+  const hintOf=r=>{
+    if(r.due_hint) return r.due_hint;
+    const m=(r.text||'').match(/(今早|明早|早上|上午|中午|下午|傍晚|晚上|今晚|睡前|饭后|周末|明天|后天|夜里)/);
+    return m?m[1]:'';
+  };
+  const exact=d.filter(r=>r.due_at);
+  const vague=d.filter(r=>!r.due_at && hintOf(r));
+  const untimed=d.filter(r=>!r.due_at && !hintOf(r));
   const head=(t,n)=>`<h4 style="margin:10px 12px 4px">${t}（${n}）</h4>`;
   const row=r=>{
-    const due=r.due_at?`<span class="small"> · ${String(r.due_at).slice(5,16).replace('T',' ')}</span>`:'';
+    const hint=!r.due_at?hintOf(r):'';
+    const due=r.due_at?`<span class="small"> · ${String(r.due_at).slice(5,16).replace('T',' ')}</span>`
+      :(hint?`<span class="small"> · ${esc(hint)}</span>`:'');
     const miss=r.state==='missed'?` <span class="small" style="color:var(--warn)">过点未做</span>`:'';
+    const st=r.state==='old'?'<span class="small" style="color:var(--warn)">旧事</span>':
+             r.state==='stale'?'<span class="small">沉默</span>':'';
     return `<div class="item" data-id="${r.id}" onclick="openTrace(${r.id},this)">
       <div><span class="kind k-${r.kind}">${KIND[r.kind]||r.kind}</span>
-      <span class="small">#${r.id}${due}</span>${miss}</div>
+      <span class="small">#${r.id}${due}</span>${miss} ${st}</div>
       <div class="txt">${esc((r.text||'').slice(0,90))}</div></div>`;};
+  const active=r=>!r.state||r.state==='open'||r.state==='missed';
   let html='';
-  if(timed.length) html += head('有时间的',timed.length)+timed.map(row).join('');
-  if(untimed.length) html += head('没时间的',untimed.length)+untimed.map(row).join('');
+  const exactA=exact.filter(active), vagueA=vague.filter(active), untimedA=untimed.filter(active);
+  const stale=d.filter(r=>r.state==='stale'), old=d.filter(r=>r.state==='old');
+  if(exactA.length) html += head('还在办 · 有确切时间',exactA.length)+exactA.map(row).join('');
+  if(vagueA.length) html += head('还在办 · 只有笼统时间',vagueA.length)+vagueA.map(row).join('');
+  if(untimedA.length) html += head('还在办 · 没时间',untimedA.length)+untimedA.map(row).join('');
+  if(stale.length) html += head('沉默',stale.length)+stale.map(row).join('');
+  if(old.length) html += head('旧事',old.length)+old.map(row).join('');
   document.getElementById('list').innerHTML = html||'<div class="empty">没有未了的事</div>';}
 async function loadRaw(){
   setTab('tab-raw');
@@ -526,6 +667,128 @@ async function loadResident(showAll=false){
     </div>`).join('');
   document.getElementById('list').innerHTML = head + (html||'<div class="empty">常驻区还是空的</div>');
   document.getElementById('detail').innerHTML='<div class="empty">她自己放进去的东西，只读</div>';
+}
+async function loadLooks(){
+  setTab('tab-looks');
+  const d=await j('/api/looks?limit=100');
+  const rows=Array.isArray(d)?d:[];
+  const head=`<div class="bar" style="padding:8px 12px;align-items:center">
+    <span class="small">先看记录 ${rows.length} 条 · 只读本地 look.jsonl</span>
+  </div>`;
+  const html=rows.map(r=>{
+    const silent=(r.reply||'').includes('<SILENT>');
+    const lookText=(r.look||'').replaceAll('<look>','').replaceAll('</look>','').trim();
+    return `
+    <div class="item">
+      <div><span class="kind">先看</span>
+        <span class="small">${fmtWhen(r.ts)} · ${esc(r.sender_name||r.sender_id||'')} · #${esc(r.message_id||'')}</span>
+        ${silent?'<span class="small" style="color:var(--warn);margin-left:6px">选择不接</span>':''}</div>
+      <div class="txt" style="white-space:pre-wrap">${esc(lookText)}</div>
+      <div class="small" style="margin-top:4px">回复：${silent?'（<SILENT>）':esc((r.reply||'').slice(0,160))}</div>
+    </div>`;
+  }).join('');
+  document.getElementById('list').innerHTML = head + (html||'<div class="empty">还没有先看记录</div>');
+  document.getElementById('detail').innerHTML='<div class="empty">她先看的内容，只读</div>';
+}
+async function loadRecallQueries(){
+  setTab('tab-recall');
+  const d=await j('/api/recall_queries?limit=200');
+  const rows=Array.isArray(d)?d:[];
+  const scene=s=>{
+    s=s||'';
+    if(s.includes('GroupMessage')) return '群 '+s.split(':').pop();
+    if(s.includes('FriendMessage')) return '私聊 '+s.split(':').pop();
+    return s;
+  };
+  const head=`<div class="bar" style="padding:8px 12px;align-items:center">
+    <span class="small">检索记录 ${rows.length} 条 · 含系统预取与 0 命中</span>
+  </div>`;
+  const html=rows.map(r=>{
+    const hits=Number(r.hits||0);
+    const src=r.trigger==='two_stage'?'系统预取':(r.trigger==='tool'?'她调用':'旧记录');
+    const filters=[r.sort,r.scope,r.kind,r.person].filter(Boolean).map(esc).join(' · ');
+    const results=Array.isArray(r.results)?r.results:[];
+    const detail=results.length?`<details style="margin-top:6px">
+      <summary class="small">明细 ${results.length} 条</summary>
+      ${results.map(x=>`<div class="small" style="margin:4px 0 4px 8px">
+        #${esc(x.id)} · ${esc(x.kind||'')} · ${esc(x.score)} · ${esc((x.text||'').slice(0,160))}</div>`).join('')}
+    </details>`:'<div class="small" style="margin-top:4px;opacity:.65">旧记录没有明细</div>';
+    return `
+    <div class="item">
+      <div><span class="kind">检索</span>
+        <span class="small">${fmtWhen(r.created_at)} · ${esc(scene(r.session_id))}</span>
+        <span class="small" style="margin-left:6px">${src}</span>
+        ${r.degraded?'<span class="small" style="color:var(--warn);margin-left:6px">向量降级</span>':''}
+        <span class="small" style="margin-left:6px">${hits} 命中</span></div>
+      <div class="txt" style="white-space:pre-wrap">${esc((r.query||'（空 query）').slice(0,300))}</div>
+      <div class="small" style="margin-top:4px">${filters||'relevance'}${r.since||r.until?` · 时间 ${esc(r.since||'…')} → ${esc(r.until||'…')}`:''}</div>
+      ${detail}
+    </div>`;
+  }).join('');
+  document.getElementById('list').innerHTML = head + (html||'<div class="empty">还没有检索记录</div>');
+  document.getElementById('detail').innerHTML='<div class="empty">她调用和系统预取的检索都记在这里，包括没查到的，只读</div>';
+}
+async function loadTwoStage(){
+  setTab('tab-pre');
+  const d=await j('/api/two_stage?limit=200');
+  const rows=Array.isArray(d)?d:[];
+  const scene=s=>{
+    s=s||'';
+    if(s.includes('GroupMessage')) return '群 '+s.split(':').pop();
+    if(s.includes('FriendMessage')) return '私聊 '+s.split(':').pop();
+    return s||'';
+  };
+  const head=`<div class="bar" style="padding:8px 12px;align-items:center">
+    <span class="small">最近 ${rows.length} 次第一段预想 · 只读</span>
+  </div>`;
+  const html=rows.map(r=>{
+    const mat=String(r.materials||'');
+    return `
+    <div class="item">
+      <div><span class="kind">预想</span>
+        <span class="small">${fmtWhen(r.created_at)} · ${esc(scene(r.session_id))}</span>
+        <span class="small" style="margin-left:6px">${esc(r.decision||'—')}</span>
+        <span class="small" style="margin-left:6px">${mat?'有材料':'没材料'}</span></div>
+      <div class="small" style="margin-top:4px">用户：${esc((r.user_text||'').slice(0,240))}</div>
+      <div class="txt" style="white-space:pre-wrap;margin-top:4px">${esc((r.thought||r.raw||'（没写想法）').slice(0,800))}</div>
+      <div class="small" style="margin-top:4px">查：${esc(r.query||'（没查）')}</div>
+      ${mat?`<details style="margin-top:6px"><summary class="small">材料</summary><div class="small" style="white-space:pre-wrap;margin-top:4px">${esc(mat.slice(0,1200))}</div></details>`:''}
+    </div>`;
+  }).join('');
+  document.getElementById('list').innerHTML = head + (html||'<div class="empty">还没有预想记录</div>');
+  document.getElementById('detail').innerHTML='<div class="empty">她第一段看到什么、怎么想、有没有查，只读</div>';
+}
+async function loadSelf(){
+  setTab('tab-self');
+  const d=await j('/api/self?days=30');
+  const traces=Array.isArray(d.traces)?d.traces:[];
+  const head=`<div class="bar" style="padding:8px 12px;align-items:center">
+    <span class="small">最近 ${esc(d.since||'30 天')} 以来 · 她选择留下的自我记忆 ${traces.length} 条</span>
+  </div>`;
+  const tr=traces.map(x=>`
+    <div class="item">
+      <div><span class="kind">自我记忆</span>
+        <span class="small">${fmtWhen(x.at)} · #${esc(x.id)}</span></div>
+      <div class="txt" style="white-space:pre-wrap">${esc((x.text||'').slice(0,600))}</div>
+    </div>`).join('');
+  document.getElementById('list').innerHTML = head + (tr || '<div class="empty">她还没有选择留下自我记忆</div>');
+  document.getElementById('detail').innerHTML='<div class="empty">只有她自己写“记住：”留下的，才算自我记忆</div>';
+}
+async function loadThoughts(){
+  setTab('tab-thoughts');
+  const d=await j('/api/self_thoughts?days=30');
+  const rows=Array.isArray(d.thoughts)?d.thoughts:[];
+  const head=`<div class="bar" style="padding:8px 12px;align-items:center">
+    <span class="small">最近 ${esc(d.since||'30 天')} 的思考过程 ${rows.length} 条 · 未选择留下，不参与检索</span>
+  </div>`;
+  const html=rows.map(x=>`
+    <div class="item">
+      <div><span class="kind">思考过程</span>
+        <span class="small">${fmtWhen(x.created_at)} · 第 ${esc(x.tick_no)} 次 · ${esc(x.status||'')}</span></div>
+      <div class="txt" style="white-space:pre-wrap">${esc((x.text||'').slice(0,800))}</div>
+    </div>`).join('');
+  document.getElementById('list').innerHTML = head + (html || '<div class="empty">还没有思考过程</div>');
+  document.getElementById('detail').innerHTML='<div class="empty">这里只是过程记录；她写“记住：”留下的，才会进「自我」</div>';
 }
 function setTab(id){document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));
   document.getElementById(id)?.classList.add('on');}
@@ -679,7 +942,7 @@ if (new URLSearchParams(location.search).get('embed') === '1') {
   document.querySelector('main').style.height = 'calc(100vh - 8px)';
 }
 // 支持 ?id=123 直接打开某一条
-const _q = new URLSearchParams(location.search); if (_q.get('tab') === 'ov') { setTimeout(() => loadOverview(), 200); } if (_q.get('tab') === 'st') { setTimeout(() => loadStats(), 200); } if (_q.get('tab') === 'series') { setTimeout(() => loadSeries(), 200); } if (_q.get('tab') === 'resident') { setTimeout(() => loadResident(), 200); } const deepId = _q.get('id');
+const _q = new URLSearchParams(location.search); if (_q.get('tab') === 'ov') { setTimeout(() => loadOverview(), 200); } if (_q.get('tab') === 'st') { setTimeout(() => loadStats(), 200); } if (_q.get('tab') === 'series') { setTimeout(() => loadSeries(), 200); } if (_q.get('tab') === 'resident') { setTimeout(() => loadResident(), 200); } if (_q.get('tab') === 'looks') { setTimeout(() => loadLooks(), 200); } if (_q.get('tab') === 'recall') { setTimeout(() => loadRecallQueries(), 200); } if (_q.get('tab') === 'pre') { setTimeout(() => loadTwoStage(), 200); } if (_q.get('tab') === 'self') { setTimeout(() => loadSelf(), 200); } if (_q.get('tab') === 'thoughts') { setTimeout(() => loadThoughts(), 200); } const deepId = _q.get('id');
 if (deepId) setTimeout(() => openTrace(parseInt(deepId)), 300);
 </script></body></html>"""
 

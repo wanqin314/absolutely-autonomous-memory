@@ -22,7 +22,7 @@ class Ctx:
 
 
 class Ev:
-    unified_msg_origin = "bot:GroupMessage:123456789"
+    unified_msg_origin = "大肥鱼:GroupMessage:1130276670"
 
 
 def make(db, conf, ctx=None):
@@ -41,7 +41,7 @@ def main():
     st.conn.execute(
         "INSERT INTO raw_message(session_id,scope,role,text,sender,created_at,source) "
         "VALUES (?,?,?,?,?,?,?)",
-        ("bot:GroupMessage:123456789", "group:123456789", "user", "hi", "x",
+        ("大肥鱼:GroupMessage:1130276670", "group:1130276670", "user", "hi", "x",
          "2026-11-14T16:00:00+08:00", "live"))
     st.conn.commit()
     st.close()
@@ -49,12 +49,12 @@ def main():
     conf = {"wander_enabled": True, "wander_quiet_hours": "",
             "wander_idle_minutes": 0, "wander_max_per_day": 3,
             "wander_max_thoughts_per_day": 6,
-            "group_send_enabled": True, "group_send_allow": "123456789",
+            "group_send_enabled": True, "group_send_allow": "1130276670",
             "group_send_max_per_day": 2, "group_send_quiet_hours": ""}
 
     # 走神：群聊直接拒绝
     p = make(db, conf)
-    r = asyncio.run(p._wander_once(session="bot:GroupMessage:123456789"))
+    r = asyncio.run(p._wander_once(session="大肥鱼:GroupMessage:1130276670"))
     assert r and r.get("skipped") == "group", r
 
     # 群发：能发、会记次、到上限

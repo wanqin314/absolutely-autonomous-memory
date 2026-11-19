@@ -1,9 +1,9 @@
 name: astrbot_plugin_absolutely_autonomous_memory
 display_name: Absolutely autonomous memory
 short_desc: 绝对自主记忆：原文只追加、痕迹带版本链、她自己的记忆由她自己翻。
-desc: Absolutely autonomous memory（绝对自主记忆）。系统只负责存与递：原文只追加、痕迹带版本链、七类痕迹（事实/观察/推测/自我/未了/约定/说好的）、三段式沉默与休眠、三块字段、原话与她自己写的话、混合检索（时间/场景/对象/排序）、她自己放的常驻区、她自己分的系列（可按时间/关键词查看）、可选走神与群聊主动发话。写入与检索都遵守「不干涉」：不替她决定该想什么、该怎么感受、要不要提起。
+desc: Absolutely autonomous memory（绝对自主记忆）。系统只负责存与递：原文只追加、痕迹带版本链、七类痕迹（事实/观察/推测/自我/未了/约定/说好的）、三段式沉默与休眠、三块字段、原话与她自己写的话、混合检索（时间/场景/对象/排序）、她自己放的常驻区、她自己分的系列（可按时间/关键词查看）、自我思考与两段式预想、可选走神与群聊主动发话。写入与检索都遵守「不干涉」：不替她决定该想什么、该怎么感受、要不要提起。
 help: /mem dir｜show <id>｜history <id>｜search <词>｜touch <id>｜pending｜flush｜stats（仅管理员）
-version: v0.45.7
+version: v0.46.0
 author: 婉清
 astrbot_version: ">=4.24.2,<5"
 support_platforms:
