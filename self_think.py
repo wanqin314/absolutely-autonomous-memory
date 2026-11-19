@@ -40,6 +40,7 @@ class SelfThinker:
         self.p = plugin
         base = os.path.dirname(getattr(plugin, "db_path", "") or ".")
         self.state_path = os.path.join(base, "self_think_state.json")
+        self.settings_path = os.path.join(base, "self_think_settings.json")
         self.notes_dir = os.path.join(base, "self_thoughts")
         try:
             os.makedirs(self.notes_dir, exist_ok=True)
@@ -50,6 +51,34 @@ class SelfThinker:
         self._lock = asyncio.Lock()
 
     # ---------- 状态 ----------
+
+    _SETTING_KEYS = {
+        "self_think_enabled": "enabled",
+        "self_think_idle_min_minutes": "idle_min",
+        "self_think_idle_max_minutes": "idle_max",
+        "self_think_tick_seconds": "tick_seconds",
+        "self_think_cooldown_minutes": "cooldown_minutes",
+        "self_think_ask_enabled": "ask_enabled",
+    }
+
+    def _read_settings(self) -> dict:
+        try:
+            if os.path.exists(self.settings_path):
+                with open(self.settings_path, encoding="utf-8-sig") as f:
+                    d = json.load(f)
+                return d if isinstance(d, dict) else {}
+        except Exception:
+            pass
+        return {}
+
+    def _cfg(self, key: str, default=None):
+        """面板运行期设置优先于 AstrBot 配置，保存后下一拍生效。"""
+        field = self._SETTING_KEYS.get(key)
+        if field:
+            d = self._read_settings()
+            if field in d and d[field] is not None:
+                return d[field]
+        return self.p._cfg(key, default)
 
     def _load(self) -> dict:
         st = {
@@ -141,7 +170,7 @@ class SelfThinker:
     # ---------- 触发 ----------
 
     def _names(self) -> list[str]:
-        raw = str(self.p._cfg("self_think_names", "婉凝,大肥鱼,小鲸鱼") or "")
+        raw = str(self._cfg("self_think_names", "婉凝,大肥鱼,小鲸鱼") or "")
         return [x.strip() for x in raw.replace("，", ",").split(",") if x.strip()]
 
     def is_directed(self, event) -> bool:
@@ -207,8 +236,11 @@ class SelfThinker:
     async def _loop(self) -> None:
         while True:
             try:
-                if bool(self.p._cfg("self_think_enabled", False)):
+                if bool(self._cfg("self_think_enabled", False)):
                     await self._step()
+                elif (self.state.get("phase") or "idle") != "idle":
+                    self._end("disabled")
+                    logger.info("[memory] 自我思考：已从面板关闭")
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
@@ -217,14 +249,14 @@ class SelfThinker:
 
     def _sec(self, key: str, default: int) -> float:
         try:
-            return max(1.0, float(self.p._cfg(key, default)))
+            return max(1.0, float(self._cfg(key, default)))
         except Exception:
             return float(default)
 
     def _pick_idle_sec(self) -> float:
         try:
-            lo = float(self.p._cfg("self_think_idle_min_minutes", 10))
-            hi = float(self.p._cfg("self_think_idle_max_minutes", 60))
+            lo = float(self._cfg("self_think_idle_min_minutes", 10))
+            hi = float(self._cfg("self_think_idle_max_minutes", 60))
             if hi < lo:
                 lo, hi = hi, lo
             return random.uniform(max(1.0, lo), max(1.0, hi)) * 60
@@ -293,7 +325,7 @@ class SelfThinker:
             await self._tick(now, tick_sec)
 
     async def _begin(self, now: float, seed_id: int = 0) -> None:
-        session = str(self.p._cfg("self_think_session", "") or "").strip()
+        session = str(self._cfg("self_think_session", "") or "").strip()
         if not session:
             try:
                 st = self.p._db()
@@ -461,8 +493,6 @@ class SelfThinker:
         if answers:
             answer_text = "\n\n【婉清刚回答你】\n" + "\n".join(f"- {x}" for x in answers[-5:])
             self.state["answers"] = []
-        ask_ok = bool(self.p._cfg("self_think_ask_enabled", False))
-        ask_line = ("想对婉清说一句时，可以写一行：问：<一句话>\n" if ask_ok else "")
         prompt = (
             f"【自我时间】\n"
             f"现在：{self._iso(now)}\n\n"
@@ -472,15 +502,14 @@ class SelfThinker:
             f"{material_text}{lookup_text}{answer_text}\n\n"
             "这些只是当时留下的字，不是结论。\n"
             "想查记忆时，可以写一行：查：<关键词>\n"
-            f"{ask_line}"
             "查到的会在下一次醒来时放进来。\n"
             "这 5 分钟里没有新的对话。\n"
             "如果出现“停”这个字，这一段就结束。"
         )
-        system = str(self.p._cfg("self_think_system_prompt", SELF_THINK_SYSTEM) or SELF_THINK_SYSTEM)
+        system = str(self._cfg("self_think_system_prompt", SELF_THINK_SYSTEM) or SELF_THINK_SYSTEM)
         text = ""
         try:
-            pid = str(self.p._cfg("self_think_provider_id", "") or "")
+            pid = str(self._cfg("self_think_provider_id", "") or "")
             provider = self.p.context.get_provider_by_id(pid) if pid else None
             if provider is None:
                 try:
@@ -515,7 +544,6 @@ class SelfThinker:
             return
 
         await self._handle_queries(session, text)
-        await self._handle_asks(session, text)
 
         last_line = text.strip().splitlines()[-1].strip() if text.strip() else ""
         stopped = (
@@ -558,14 +586,14 @@ class SelfThinker:
             notice = (f"这段思考中途被打断过 {len(interruptions)} 次：\n"
                       + "\n".join(items) + "\n\n")
         ask = ""
-        if bool(self.p._cfg("self_think_memory_enabled", True)):
+        if bool(self._cfg("self_think_memory_enabled", True)):
             ask = ("先给这一段收尾，二选一：\n"
                    "记住：<一句话>\n"
                    "不留\n"
                    "如果这段让你对某条旧想法有了不同看法，可以写：改写 #编号：新的说法\n")
-        ask_ok = bool(self.p._cfg("self_think_ask_enabled", False))
+        ask_ok = bool(self._cfg("self_think_ask_enabled", False))
         ask_tail = ("想问的，可以在收尾之后再另起一行：问：<一句话>\n" if ask_ok else "")
-        ask_note = ("整段记录只留在这里；只有“问：”那一句会发给我。"
+        ask_note = ("整段记录只留在这里；只有“问：”那一句会发给我，并写进我们的对话。"
                     if ask_ok else "整段记录只留在这里，不会发出去。")
         prompt = (
             f"【这段思考到这里了】\n"
@@ -576,10 +604,10 @@ class SelfThinker:
             f"{ask_tail}"
             f"{ask_note}"
         )
-        system = str(self.p._cfg("self_think_system_prompt", SELF_THINK_SYSTEM) or SELF_THINK_SYSTEM)
+        system = str(self._cfg("self_think_system_prompt", SELF_THINK_SYSTEM) or SELF_THINK_SYSTEM)
         text = ""
         try:
-            pid = str(self.p._cfg("self_think_provider_id", "") or "")
+            pid = str(self._cfg("self_think_provider_id", "") or "")
             provider = self.p.context.get_provider_by_id(pid) if pid else None
             if provider is None:
                 try:
@@ -600,7 +628,7 @@ class SelfThinker:
             logger.warning(f"[memory] 自我思考收尾失败：{type(e).__name__}: {e}")
             return
         if text:
-            _memory_on = bool(self.p._cfg("self_think_memory_enabled", True))
+            _memory_on = bool(self._cfg("self_think_memory_enabled", True))
             if _memory_on and not self._has_choice(text):
                 logger.info("[memory] 自我思考收尾：她只问了话，还没选记住/不留，追问一次")
                 retry = (
@@ -626,7 +654,7 @@ class SelfThinker:
             self._save_thought(session, 0, text, "closing")
             self._revise_marked(session, text)
             self._record_marked(session, text)
-            await self._handle_asks(session, text)
+            await self._handle_asks(session, text, enter_context=True)
             logger.info(f"[memory] 自我思考收尾（{reason}）：{text[:80]}")
 
     def _revise_marked(self, session: str, text: str) -> None:
@@ -692,9 +720,31 @@ class SelfThinker:
         finally:
             st.close()
 
-    async def _handle_asks(self, session: str, text: str) -> None:
-        """她写「问：一句话」：可以主动开口；一次醒来最多 1 条，整段最多 3 条。"""
-        if not bool(self.p._cfg("self_think_ask_enabled", False)):
+    async def _append_to_conversation(self, session: str, msg: str) -> None:
+        """把收尾提问追加成一条 assistant 消息，后面聊天能看见。"""
+        try:
+            cm = getattr(self.p.context, "conversation_manager", None)
+            if cm is None:
+                return
+            cid = await cm.get_curr_conversation_id(session)
+            if not cid:
+                return
+            conv = await cm.get_conversation(session, cid)
+            if not conv:
+                return
+            raw = getattr(conv, "history", "") or "[]"
+            history = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(history, list):
+                return
+            history.append({"role": "assistant", "content": msg})
+            await cm.update_conversation(session, conversation_id=cid, history=history)
+            logger.info("[memory] 自我思考提问已写入上下文")
+        except Exception as e:  # noqa: BLE001
+            logger.info(f"[memory] 自我思考提问写入上下文失败：{type(e).__name__}: {e}")
+
+    async def _handle_asks(self, session: str, text: str, enter_context: bool = False) -> None:
+        """收尾写「问：一句话」：发出去；enter_context 时同时写进对话历史。"""
+        if not bool(self._cfg("self_think_ask_enabled", False)):
             return
         asks = re.findall(r"(?m)^\s*问\s*[:：]\s*(.+?)\s*$", text or "")
         if not asks:
@@ -712,11 +762,14 @@ class SelfThinker:
             return
         if ok:
             self.state["asked"] = int(self.state.get("asked") or 0) + 1
-            self.state["waiting_answer"] = True
-            self.state["resume_at"] = 0.0
-            self.state["phase"] = "paused"
-            self.state["last_activity"] = time.time()
-            self.state["last_tick_at"] = 0.0
+            if enter_context:
+                await self._append_to_conversation(session, msg)
+            else:
+                self.state["waiting_answer"] = True
+                self.state["resume_at"] = 0.0
+                self.state["phase"] = "paused"
+                self.state["last_activity"] = time.time()
+                self.state["last_tick_at"] = 0.0
             logger.info(f"[memory] 自我思考开口：{msg[:60]}")
             self._save()
 
@@ -748,7 +801,7 @@ class SelfThinker:
 
     def _record_marked(self, session: str, text: str) -> None:
         """收尾时只把她明确写「记住：」的那一句写进长期记忆；一次最多一条。"""
-        if not bool(self.p._cfg("self_think_memory_enabled", True)):
+        if not bool(self._cfg("self_think_memory_enabled", True)):
             return
         if int(self.state.get("remembered") or 0) >= 1:
             return

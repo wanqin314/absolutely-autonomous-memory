@@ -175,6 +175,57 @@ def api_recall_queries(limit: int = 100):
         s.close()
 
 
+@app.get("/api/self_think_settings")
+def api_self_think_settings():
+    settings_path = os.path.join(os.path.dirname(DB), "self_think_settings.json")
+    data_dir = os.path.dirname(os.path.dirname(os.path.dirname(DB)))
+    cfg_path = os.path.join(data_dir, "config", "astrbot_plugin_absolutely_autonomous_memory_config.json")
+    cfg = {}
+    try:
+        if os.path.exists(cfg_path):
+            cfg = json.load(open(cfg_path, encoding="utf-8-sig"))
+    except Exception:
+        cfg = {}
+    over = {}
+    try:
+        if os.path.exists(settings_path):
+            over = json.load(open(settings_path, encoding="utf-8-sig"))
+    except Exception:
+        over = {}
+    def val(field, key, default):
+        return over.get(field, cfg.get(key, default))
+    return {
+        "enabled": bool(val("enabled", "self_think_enabled", False)),
+        "idle_min": int(val("idle_min", "self_think_idle_min_minutes", 10)),
+        "idle_max": int(val("idle_max", "self_think_idle_max_minutes", 60)),
+        "tick_seconds": int(val("tick_seconds", "self_think_tick_seconds", 300)),
+        "cooldown_minutes": int(val("cooldown_minutes", "self_think_cooldown_minutes", 120)),
+        "ask_enabled": bool(val("ask_enabled", "self_think_ask_enabled", False)),
+    }
+
+
+@app.post("/api/self_think_settings")
+async def api_save_self_think_settings(payload: dict):
+    try:
+        enabled = bool(payload.get("enabled", False))
+        idle_min = max(5, min(180, int(payload.get("idle_min", 10))))
+        idle_max = max(idle_min, min(240, int(payload.get("idle_max", 60))))
+        tick_seconds = max(30, min(3600, int(payload.get("tick_seconds", 300))))
+        cooldown = max(0, min(1440, int(payload.get("cooldown_minutes", 120))))
+        ask_enabled = bool(payload.get("ask_enabled", False))
+        out = {"enabled": enabled, "idle_min": idle_min, "idle_max": idle_max,
+               "tick_seconds": tick_seconds, "cooldown_minutes": cooldown,
+               "ask_enabled": ask_enabled}
+        path = os.path.join(os.path.dirname(DB), "self_think_settings.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return {"ok": True, **out}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": type(e).__name__}, status_code=400)
+
+
 @app.get("/api/two_stage")
 def api_two_stage(limit: int = 100):
     """两段式第一段的预想记录：用户消息、判断、查词、想法、材料。"""
@@ -776,19 +827,46 @@ async function loadSelf(){
 }
 async function loadThoughts(){
   setTab('tab-thoughts');
-  const d=await j('/api/self_thoughts?days=30');
+  const [d,s]=await Promise.all([j('/api/self_thoughts?days=30'), j('/api/self_think_settings')]);
   const rows=Array.isArray(d.thoughts)?d.thoughts:[];
   const head=`<div class="bar" style="padding:8px 12px;align-items:center">
     <span class="small">最近 ${esc(d.since||'30 天')} 的思考过程 ${rows.length} 条 · 未选择留下，不参与检索</span>
+  </div>
+  <div class="item" style="margin:8px 12px">
+    <div class="small" style="margin-bottom:6px">自我思考设置（保存后下一拍生效）</div>
+    <label class="small"><input type="checkbox" id="st-enabled" ${s.enabled?'checked':''}> 开启思考</label>
+    <label class="small" style="margin-left:10px"><input type="checkbox" id="st-ask" ${s.ask_enabled?'checked':''}> 收尾可提问</label>
+    <div class="small" style="margin-top:6px">空闲
+      <input id="st-idle-min" type="number" min="5" max="180" value="${esc(s.idle_min)}" style="width:58px"> –
+      <input id="st-idle-max" type="number" min="5" max="240" value="${esc(s.idle_max)}" style="width:58px"> 分钟
+      · 冷却 <input id="st-cooldown" type="number" min="0" max="1440" value="${esc(s.cooldown_minutes)}" style="width:62px"> 分钟
+      · 每轮 <input id="st-tick" type="number" min="30" max="3600" value="${esc(s.tick_seconds)}" style="width:68px"> 秒
+    </div>
+    <div style="margin-top:8px"><button onclick="saveSelfThinkSettings()">保存</button>
+      <span id="st-msg" class="small" style="margin-left:8px"></span></div>
   </div>`;
   const html=rows.map(x=>`
-    <div class="item">
-      <div><span class="kind">思考过程</span>
-        <span class="small">${fmtWhen(x.created_at)} · 第 ${esc(x.tick_no)} 次 · ${esc(x.status||'')}</span></div>
-      <div class="txt" style="white-space:pre-wrap">${esc((x.text||'').slice(0,800))}</div>
-    </div>`).join('');
+  <div class="item">
+    <div><span class="kind">思考过程</span>
+      <span class="small">${fmtWhen(x.created_at)} · 第 ${esc(x.tick_no)} 次 · ${esc(x.status||'')}</span></div>
+    <div class="txt" style="white-space:pre-wrap">${esc((x.text||'').slice(0,800))}</div>
+  </div>`).join('');
   document.getElementById('list').innerHTML = head + (html || '<div class="empty">还没有思考过程</div>');
   document.getElementById('detail').innerHTML='<div class="empty">这里只是过程记录；她写“记住：”留下的，才会进「自我」</div>';
+}
+async function saveSelfThinkSettings(){
+  const body={
+    enabled: document.getElementById('st-enabled').checked,
+    ask_enabled: document.getElementById('st-ask').checked,
+    idle_min: Number(document.getElementById('st-idle-min').value),
+    idle_max: Number(document.getElementById('st-idle-max').value),
+    cooldown_minutes: Number(document.getElementById('st-cooldown').value),
+    tick_seconds: Number(document.getElementById('st-tick').value),
+  };
+  const r=await j('/api/self_think_settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const msg=document.getElementById('st-msg');
+  msg.textContent = r.ok ? '已保存' : ('保存失败：'+(r.error||''));
+  if(r.ok){ setTimeout(()=>loadThoughts(), 600); }
 }
 function setTab(id){document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('on'));
   document.getElementById(id)?.classList.add('on');}
